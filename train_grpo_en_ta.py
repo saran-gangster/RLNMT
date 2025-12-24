@@ -1,6 +1,10 @@
 # train_grpo_gemma_en_ta.py
 # GRPO training for English->Tamil with Gemma-3-1B-IT, DuPO reward (cycle COMET-DA + QE COMETKiwi)
 
+
+
+# pip install -U "trl" "transformers>=4.45" "accelerate" "datasets" sentencepiece
+# pip install -U unbabel-comet
 from __future__ import annotations
 
 import os
