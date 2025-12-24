@@ -6,8 +6,8 @@ from dataclasses import dataclass
 
 import torch
 from datasets import load_dataset
-from transformers import AutoTokenizer, Gemma3ForCausalLM
 
+from transformers import AutoTokenizer, Gemma3ForCausalLM
 from trl import GRPOTrainer, GRPOConfig
 
 from rewards_en_ta_dupo import CometDuPOReward
@@ -16,10 +16,16 @@ from rewards_en_ta_dupo import CometDuPOReward
 @dataclass
 class RunCfg:
     model_id: str = "google/gemma-3-1b-it"
+
+    # Stream C4 instead of downloading it
     dataset_name: str = "allenai/c4"
     dataset_config: str = "en"
-    dataset_split: str = "train[:20000]"
+    dataset_split: str = "train"          # IMPORTANT: use "train" with streaming, not "train[:...]" slices
     text_field: str = "text"
+
+    # Only keep a tiny sample
+    num_train_samples: int = 3000         # set to 1000–3000 per your disk constraints
+    shuffle_buffer: int = 10_000          # streaming shuffle buffer; lower if RAM is tight
 
     output_dir: str = "./grpo_gemma_en_ta_ckpts"
     max_steps: int = 200
@@ -48,16 +54,17 @@ def make_gemma_prompt(english: str) -> str:
 
 
 def main() -> None:
+    # Reduce noisy fork warnings + avoid tokenizer deadlocks
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
     cfg = RunCfg()
     os.makedirs(cfg.output_dir, exist_ok=True)
 
-    if torch.cuda.is_available():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cuda":
         torch.set_float32_matmul_precision("high")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
+    # --- Model / tokenizer ---
     tok = AutoTokenizer.from_pretrained(cfg.model_id, use_fast=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
@@ -68,20 +75,34 @@ def main() -> None:
         torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
     ).to(device)
 
-    ds = load_dataset(cfg.dataset_name, cfg.dataset_config, split=cfg.dataset_split)
+    # --- Dataset: STREAMING + TAKE N ---
+    ds = load_dataset(
+        cfg.dataset_name,
+        cfg.dataset_config,
+        split=cfg.dataset_split,
+        streaming=True,            # <-- key: no full download
+    )
+
+    # Streaming shuffle is approximate; good enough for a pilot
+    if cfg.shuffle_buffer and cfg.shuffle_buffer > 0:
+        ds = ds.shuffle(seed=cfg.seed, buffer_size=cfg.shuffle_buffer)
+
+    # Take only N examples (this is what saves disk)
+    ds = ds.take(cfg.num_train_samples)
 
     def to_prompt(ex):
         return {"prompt": make_gemma_prompt(ex.get(cfg.text_field, ""))}
 
-    ds = ds.map(to_prompt, remove_columns=ds.column_names)
+    ds = ds.map(to_prompt)
 
+    # --- Reward ---
     reward_fn = CometDuPOReward(
         cycle_metric_name="Unbabel/wmt22-comet-da",
         qe_metric_name="Unbabel/wmt22-cometkiwi-da",
         dual_model_name="facebook/nllb-200-distilled-1.3B",
         w_cycle=0.7,
         w_qe=0.3,
-        normalize="identity",  # IMPORTANT FIX
+        normalize="identity",
         reward_device=device,
         dual_device=device,
         comet_batch_size=16,
@@ -89,6 +110,7 @@ def main() -> None:
         dual_use_safetensors=True,
     )
 
+    # --- TRL config ---
     training_args = GRPOConfig(
         output_dir=cfg.output_dir,
         max_steps=cfg.max_steps,
@@ -104,13 +126,14 @@ def main() -> None:
         save_steps=50,
         report_to="tensorboard",
         seed=cfg.seed,
+        remove_unused_columns=False,  # helpful when using iterable/streaming datasets
     )
 
     trainer = GRPOTrainer(
         model=model,
         reward_funcs=[reward_fn],
         args=training_args,
-        train_dataset=ds,
+        train_dataset=ds,          # IterableDataset from streaming
         processing_class=tok,
     )
 
