@@ -1,11 +1,11 @@
-# train_grpo_gemma_en_ta.py
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import List, Dict
 
 import torch
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 
 from transformers import AutoTokenizer, Gemma3ForCausalLM
 from trl import GRPOTrainer, GRPOConfig
@@ -17,13 +17,18 @@ from rewards_en_ta_dupo import CometDuPOReward
 class RunCfg:
     model_id: str = "google/gemma-3-1b-it"
 
+    # C4 streaming source (won't download full dataset)
     dataset_name: str = "allenai/c4"
     dataset_config: str = "en"
     dataset_split: str = "train"
     text_field: str = "text"
 
-    num_train_samples: int = 3000
-    shuffle_buffer: int = 10_000
+    # Only materialize this many samples into a real Dataset
+    num_train_samples: int = 2000   # set 1000–3000
+    shuffle_buffer: int = 10_000    # streaming shuffle buffer; reduce if RAM is tight
+
+    # Prompt truncation to keep examples small + stable
+    max_chars: int = 800
 
     output_dir: str = "./grpo_gemma_en_ta_ckpts"
     max_steps: int = 200
@@ -51,6 +56,35 @@ def make_gemma_prompt(english: str) -> str:
     )
 
 
+def materialize_small_dataset(cfg: RunCfg) -> Dataset:
+    """
+    Streams C4, shuffles approximately, takes N, then builds a small map-style Dataset.
+    This avoids downloading the entire C4 Arrow dataset to disk.
+    """
+    stream = load_dataset(
+        cfg.dataset_name,
+        cfg.dataset_config,
+        split=cfg.dataset_split,
+        streaming=True,
+    )
+
+    if cfg.shuffle_buffer and cfg.shuffle_buffer > 0:
+        stream = stream.shuffle(seed=cfg.seed, buffer_size=cfg.shuffle_buffer)
+
+    rows: List[Dict[str, str]] = []
+    for ex in stream.take(cfg.num_train_samples):
+        text = (ex.get(cfg.text_field) or "").strip()
+        if not text:
+            continue
+        text = text[: cfg.max_chars]
+        rows.append({"prompt": make_gemma_prompt(text)})
+
+    if len(rows) == 0:
+        raise RuntimeError("No examples were materialized. Check dataset/text_field settings.")
+
+    return Dataset.from_list(rows)
+
+
 def main() -> None:
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -61,6 +95,7 @@ def main() -> None:
     if device == "cuda":
         torch.set_float32_matmul_precision("high")
 
+    # Tokenizer / model (bf16 on A100)
     tok = AutoTokenizer.from_pretrained(cfg.model_id, use_fast=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
@@ -68,23 +103,11 @@ def main() -> None:
 
     model = Gemma3ForCausalLM.from_pretrained(
         cfg.model_id,
-        dtype=torch.bfloat16 if device == "cuda" else torch.float32,  # <-- dtype (not torch_dtype)
+        dtype=torch.bfloat16 if device == "cuda" else torch.float32,  # dtype (not torch_dtype)
     ).to(device)
 
-    # STREAMING dataset: does not download full C4
-    ds = load_dataset(
-        cfg.dataset_name,
-        cfg.dataset_config,
-        split=cfg.dataset_split,
-        streaming=True,
-    )
-
-    if cfg.shuffle_buffer and cfg.shuffle_buffer > 0:
-        ds = ds.shuffle(seed=cfg.seed, buffer_size=cfg.shuffle_buffer)
-
-    ds = ds.take(cfg.num_train_samples)
-
-    ds = ds.map(lambda ex: {"prompt": make_gemma_prompt(ex.get(cfg.text_field, ""))})
+    # Build a tiny map-style dataset from streaming
+    ds = materialize_small_dataset(cfg)
 
     reward_fn = CometDuPOReward(
         cycle_metric_name="Unbabel/wmt22-comet-da",
@@ -102,11 +125,14 @@ def main() -> None:
         max_steps=cfg.max_steps,
         learning_rate=cfg.lr,
         beta=cfg.kl_beta,
+
         per_device_train_batch_size=1,
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
+
         num_generations=cfg.group_size,
         temperature=cfg.temperature,
         max_completion_length=cfg.max_new_tokens,
+
         bf16=(device == "cuda"),
         logging_steps=10,
         save_steps=50,
@@ -117,9 +143,9 @@ def main() -> None:
 
     trainer = GRPOTrainer(
         model=model,
-        reward_funcs=[reward_fn],   # now OK: reward_fn has __name__
+        reward_funcs=[reward_fn],
         args=training_args,
-        train_dataset=ds,
+        train_dataset=ds,          # <-- now a standard Dataset, GRPOTrainer accepts it
         processing_class=tok,
     )
 
