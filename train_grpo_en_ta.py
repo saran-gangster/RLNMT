@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 import torch
 from datasets import load_dataset, Dataset
@@ -15,28 +15,39 @@ from rewards_en_ta_dupo import CometDuPOReward
 
 @dataclass
 class RunCfg:
+    # Model
     model_id: str = "google/gemma-3-1b-it"
 
+    # Monolingual English data (stream then materialize only N rows)
     dataset_name: str = "allenai/c4"
     dataset_config: str = "en"
     dataset_split: str = "train"
     text_field: str = "text"
-
-    num_train_samples: int = 2000
+    num_train_samples: int = 2000          # set 1000–3000
     shuffle_buffer: int = 10_000
     max_chars: int = 800
 
+    # GRPO run
     output_dir: str = "./grpo_gemma_en_ta_ckpts"
     max_steps: int = 200
-
     group_size: int = 4
     temperature: float = 0.8
     max_new_tokens: int = 256
-
     lr: float = 1e-6
     kl_beta: float = 0.05
     gradient_accumulation_steps: int = 4
     seed: int = 42
+
+    # ---- Weights & Biases logging ----
+    use_wandb: bool = True
+
+    # Paste your key here if you want (DO NOT COMMIT THIS FILE if you do)
+    wandb_api_key: str = ""  # e.g. "abcd1234..."; leave "" to use env var / existing login
+
+    wandb_project: str = "rl-nmt-en-ta-dupo"
+    wandb_entity: str = ""   # optional; set if your org requires it
+    wandb_run_name: str = "gemma3-1b-it-grpo-en-ta"
+    wandb_mode: str = "online"  # "online" or "offline"
 
 
 def make_gemma_prompt(english: str) -> str:
@@ -59,7 +70,6 @@ def materialize_small_dataset(cfg: RunCfg) -> Dataset:
         split=cfg.dataset_split,
         streaming=True,
     )
-
     if cfg.shuffle_buffer and cfg.shuffle_buffer > 0:
         stream = stream.shuffle(seed=cfg.seed, buffer_size=cfg.shuffle_buffer)
 
@@ -71,22 +81,45 @@ def materialize_small_dataset(cfg: RunCfg) -> Dataset:
         text = text[: cfg.max_chars]
         rows.append({"prompt": make_gemma_prompt(text)})
 
-    if len(rows) == 0:
-        raise RuntimeError("No examples were materialized. Check dataset/text_field settings.")
+    if not rows:
+        raise RuntimeError("No examples materialized; check dataset/text_field.")
 
     return Dataset.from_list(rows)
 
 
-def main() -> None:
+def setup_wandb(cfg: RunCfg) -> None:
+    if not cfg.use_wandb:
+        os.environ["WANDB_DISABLED"] = "true"
+        return
+
+    # Avoid tokenizer fork warnings
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
+    os.environ.setdefault("WANDB_PROJECT", cfg.wandb_project)
+    if cfg.wandb_entity:
+        os.environ.setdefault("WANDB_ENTITY", cfg.wandb_entity)
+    os.environ.setdefault("WANDB_MODE", cfg.wandb_mode)
+
+    # If user pasted the key, use it (don’t print it)
+    if cfg.wandb_api_key:
+        os.environ["WANDB_API_KEY"] = cfg.wandb_api_key
+
+        # Optional explicit login (more reliable than relying on env alone)
+        import wandb
+        wandb.login(key=cfg.wandb_api_key, relogin=True)
+
+
+def main() -> None:
     cfg = RunCfg()
     os.makedirs(cfg.output_dir, exist_ok=True)
+
+    setup_wandb(cfg)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cuda":
         torch.set_float32_matmul_precision("high")
 
+    # Tokenizer / model (bf16 on A100)
     tok = AutoTokenizer.from_pretrained(cfg.model_id, use_fast=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
@@ -115,23 +148,20 @@ def main() -> None:
         max_steps=cfg.max_steps,
         learning_rate=cfg.lr,
         beta=cfg.kl_beta,
-
         per_device_train_batch_size=1,
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
-
         num_generations=cfg.group_size,
         temperature=cfg.temperature,
         max_completion_length=cfg.max_new_tokens,
-
         bf16=(device == "cuda"),
         logging_steps=10,
         save_steps=50,
-
-        # IMPORTANT: avoid TensorBoard dependency
-        report_to="none",
-
         seed=cfg.seed,
         remove_unused_columns=False,
+
+        # W&B
+        report_to=(["wandb"] if cfg.use_wandb else ["none"]),
+        run_name=cfg.wandb_run_name,
     )
 
     trainer = GRPOTrainer(
