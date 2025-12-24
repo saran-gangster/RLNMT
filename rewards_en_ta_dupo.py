@@ -1,12 +1,4 @@
-# rewards_en_ta_dupo.py
-# DuPO-style compound reward:
-#   cycle (COMET-DA, reference-based) + QE/fluency (COMETKiwi-DA, reference-free)
-# with oracle dual back-translation (NLLB Ta->En, frozen)
-#
-# Normalization FIX:
-#   default normalize="identity" => clamp raw COMET scores to [0, 1]
-#   (your logs show wmt22-comet-da and wmt22-cometkiwi-da already output in [0,1]-ish)
-
+# rewards_en_ta_dupo.py (FULL CLASS with __name__ added)
 from __future__ import annotations
 
 import math
@@ -16,7 +8,6 @@ from typing import Any, Dict, List, Sequence, Union
 
 import torch
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-
 from comet import download_model, load_from_checkpoint
 
 PromptType = Union[str, List[Dict[str, Any]]]
@@ -24,13 +15,10 @@ CompletionType = Union[str, List[Dict[str, Any]]]
 
 _LATIN_RE = re.compile(r"[A-Za-z]")
 _TAMIL_RE = re.compile(r"[\u0B80-\u0BFF]")
-
-# Gemma control tokens sometimes appear in decoded text
 _GEMMA_CTRL = re.compile(r"<start_of_turn>|<end_of_turn>|user|model")
 
 
 def _content_to_text(content: Any) -> str:
-    """Gemma messages may store content as a string OR as a list of {"type":"text","text":...} chunks."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -45,7 +33,6 @@ def _content_to_text(content: Any) -> str:
 
 
 def _to_text(x: Any) -> str:
-    """Handles TRL passing strings or chat-like lists of messages."""
     if isinstance(x, str):
         return x
     if isinstance(x, list) and len(x) > 0 and isinstance(x[0], dict):
@@ -60,10 +47,6 @@ def _strip_control(text: str) -> str:
 
 
 def _extract_english_from_prompt(prompt_text: str) -> str:
-    """
-    Extract the last 'English:' ... 'Tamil:' block (safer than split).
-    Falls back to full prompt if markers not found.
-    """
     head, sep, tail = prompt_text.rpartition("English:")
     if not sep:
         return prompt_text.strip()
@@ -105,15 +88,6 @@ def _norm_identity_clamp01(x: torch.Tensor) -> torch.Tensor:
     return torch.clamp(x, 0.0, 1.0)
 
 
-def _norm_sigmoid(x: torch.Tensor) -> torch.Tensor:
-    return torch.sigmoid(x)
-
-
-def _norm_linear_minus1_plus1_to_01(x: torch.Tensor) -> torch.Tensor:
-    # For metrics that genuinely output ~[-1, +1]
-    return torch.clamp((x + 1.0) / 2.0, 0.0, 1.0)
-
-
 def _length_ratio_penalty(src_en: str, mt_ta: str) -> float:
     en_len = max(1, len(src_en.split()))
     ta_len = max(1, len(mt_ta.split()))
@@ -132,76 +106,60 @@ def _script_penalty(mt_ta: str) -> float:
 
 @dataclass
 class CometDuPOReward:
-    # Dual/oracle backtranslation
     dual_model_name: str = "facebook/nllb-200-distilled-1.3B"
+    cycle_metric_name: str = "Unbabel/wmt22-comet-da"
+    qe_metric_name: str = "Unbabel/wmt22-cometkiwi-da"
 
-    # Metric split
-    cycle_metric_name: str = "Unbabel/wmt22-comet-da"       # reference-based
-    qe_metric_name: str = "Unbabel/wmt22-cometkiwi-da"      # reference-free
-
-    # weights
     w_cycle: float = 0.7
     w_qe: float = 0.3
 
-    # penalties
     penalty_weight_script: float = 0.10
     penalty_weight_lenratio: float = 0.05
 
-    # normalization: "identity" (recommended), "sigmoid", "linear"
     normalize: str = "identity"
 
-    # devices
     reward_device: str = "cuda"
     dual_device: str = "cuda"
-
     comet_batch_size: int = 16
 
-    # dual dtype and safe loading
     dual_dtype_bf16: bool = True
     dual_use_safetensors: bool = True
+
+    @property
+    def __name__(self) -> str:
+        # TRL expects reward_funcs[i].__name__
+        return "comet_dupo_reward"
 
     def __post_init__(self) -> None:
         self._reward_device = torch.device(self.reward_device)
         self._dual_device = torch.device(self.dual_device)
 
-        # --- Load COMET metrics ---
         cycle_path = download_model(self.cycle_metric_name)
-        self.comet_cycle = load_from_checkpoint(cycle_path)
-        self.comet_cycle.eval()
+        self.comet_cycle = load_from_checkpoint(cycle_path).eval()
 
         qe_path = download_model(self.qe_metric_name)
-        self.comet_qe = load_from_checkpoint(qe_path)
-        self.comet_qe.eval()
+        self.comet_qe = load_from_checkpoint(qe_path).eval()
 
-        # Move to device if possible (COMET sometimes manages internally)
         for m in (self.comet_cycle, self.comet_qe):
             try:
                 m.to(self._reward_device)
             except Exception:
                 pass
 
-        # --- Load dual back-translation model (frozen) ---
         self.bt_tok = AutoTokenizer.from_pretrained(self.dual_model_name, use_fast=True)
         dtype = torch.bfloat16 if (self.dual_dtype_bf16 and self._dual_device.type == "cuda") else None
 
-        # IMPORTANT: use_safetensors avoids torch.load(.bin) restrictions on torch<2.6
         self.bt_model = AutoModelForSeq2SeqLM.from_pretrained(
             self.dual_model_name,
-            dtype=dtype,  # torch_dtype is deprecated in your environment
+            dtype=dtype,  # avoids torch_dtype deprecation warning in your env
             use_safetensors=self.dual_use_safetensors,
             low_cpu_mem_usage=True,
-        )
+        ).to(self._dual_device).eval()
 
-        self.bt_model.to(self._dual_device)
-        self.bt_model.eval()
         for p in self.bt_model.parameters():
             p.requires_grad_(False)
 
     def _predict_scores(self, metric, data: List[Dict[str, str]]) -> torch.Tensor:
-        """
-        Robust to COMET version differences.
-        Tries multiple signatures and extracts scores.
-        """
         out = None
         try:
             out = metric.predict(
@@ -229,17 +187,9 @@ class CometDuPOReward:
     def _normalize(self, x: torch.Tensor) -> torch.Tensor:
         if self.normalize == "identity":
             return _norm_identity_clamp01(x)
-        if self.normalize == "sigmoid":
-            return _norm_sigmoid(x)
-        if self.normalize == "linear":
-            return _norm_linear_minus1_plus1_to_01(x)
-        raise ValueError(f"Unknown normalize={self.normalize!r}. Use 'identity', 'sigmoid', or 'linear'.")
+        raise ValueError("This build expects normalize='identity'.")
 
     def score_components(self, prompt_texts: List[str], ta_hyps: List[str]) -> Dict[str, Any]:
-        """
-        Convenience helper for debugging (not used by TRL directly).
-        Returns raw + normalized components and penalties.
-        """
         sources_en = [_extract_english_from_prompt(t) for t in prompt_texts]
         ta_hyps = [_strip_control(c) for c in ta_hyps]
 
