@@ -181,8 +181,26 @@ class CometDuPOReward:
 
         # --- Load dual back-translation model (frozen) ---
         self.bt_tok = AutoTokenizer.from_pretrained(self.dual_model_name, use_fast=True)
+
         dtype = torch.bfloat16 if (self.dual_dtype_bf16 and self._dual_device.type == "cuda") else None
-        self.bt_model = AutoModelForSeq2SeqLM.from_pretrained(self.dual_model_name, torch_dtype=dtype)
+
+        try:
+            # Force safetensors to avoid torch.load(.bin) restriction on torch<2.6
+            self.bt_model = AutoModelForSeq2SeqLM.from_pretrained(
+                self.dual_model_name,
+                dtype=dtype,                 # torch_dtype is deprecated in your setup
+                use_safetensors=True,
+                low_cpu_mem_usage=True,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load dual model '{self.dual_model_name}' with safetensors.\n"
+                f"To proceed, either:\n"
+                f"  1) ensure the repo has a *.safetensors weight file (preferred), or\n"
+                f"  2) upgrade torch to >= 2.6 to allow loading *.bin safely.\n"
+                f"Original error: {repr(e)}"
+            )
+
         self.bt_model.to(self._dual_device)
         self.bt_model.eval()
         for p in self.bt_model.parameters():
