@@ -17,17 +17,13 @@ from rewards_en_ta_dupo import CometDuPOReward
 class RunCfg:
     model_id: str = "google/gemma-3-1b-it"
 
-    # C4 streaming source (won't download full dataset)
     dataset_name: str = "allenai/c4"
     dataset_config: str = "en"
     dataset_split: str = "train"
     text_field: str = "text"
 
-    # Only materialize this many samples into a real Dataset
-    num_train_samples: int = 2000   # set 1000–3000
-    shuffle_buffer: int = 10_000    # streaming shuffle buffer; reduce if RAM is tight
-
-    # Prompt truncation to keep examples small + stable
+    num_train_samples: int = 2000
+    shuffle_buffer: int = 10_000
     max_chars: int = 800
 
     output_dir: str = "./grpo_gemma_en_ta_ckpts"
@@ -57,10 +53,6 @@ def make_gemma_prompt(english: str) -> str:
 
 
 def materialize_small_dataset(cfg: RunCfg) -> Dataset:
-    """
-    Streams C4, shuffles approximately, takes N, then builds a small map-style Dataset.
-    This avoids downloading the entire C4 Arrow dataset to disk.
-    """
     stream = load_dataset(
         cfg.dataset_name,
         cfg.dataset_config,
@@ -95,7 +87,6 @@ def main() -> None:
     if device == "cuda":
         torch.set_float32_matmul_precision("high")
 
-    # Tokenizer / model (bf16 on A100)
     tok = AutoTokenizer.from_pretrained(cfg.model_id, use_fast=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
@@ -103,10 +94,9 @@ def main() -> None:
 
     model = Gemma3ForCausalLM.from_pretrained(
         cfg.model_id,
-        dtype=torch.bfloat16 if device == "cuda" else torch.float32,  # dtype (not torch_dtype)
+        dtype=torch.bfloat16 if device == "cuda" else torch.float32,
     ).to(device)
 
-    # Build a tiny map-style dataset from streaming
     ds = materialize_small_dataset(cfg)
 
     reward_fn = CometDuPOReward(
@@ -136,7 +126,10 @@ def main() -> None:
         bf16=(device == "cuda"),
         logging_steps=10,
         save_steps=50,
-        report_to="tensorboard",
+
+        # IMPORTANT: avoid TensorBoard dependency
+        report_to="none",
+
         seed=cfg.seed,
         remove_unused_columns=False,
     )
@@ -145,7 +138,7 @@ def main() -> None:
         model=model,
         reward_funcs=[reward_fn],
         args=training_args,
-        train_dataset=ds,          # <-- now a standard Dataset, GRPOTrainer accepts it
+        train_dataset=ds,
         processing_class=tok,
     )
 
