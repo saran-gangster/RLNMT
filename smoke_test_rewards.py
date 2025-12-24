@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import torch
 
@@ -29,40 +30,30 @@ def make_gemma_prompt(english: str) -> str:
 
 def strip_ctrl(text: str) -> str:
     text = text.replace("\u200b", "")
-    text = CTRL_RE.sub("", text)
-    text = text.strip()
-    # If model emits end_of_turn, truncate there
+    text = CTRL_RE.sub("", text).strip()
     if END_TURN in text:
         text = text.split(END_TURN, 1)[0]
     return " ".join(text.split()).strip()
 
 
-def extract_english(prompt: str) -> str:
-    # Safe “last occurrence” extraction
-    head, sep, tail = prompt.rpartition("English:")
-    if not sep:
-        return prompt.strip()
-    en, sep2, _ = tail.partition("Tamil:")
-    return (en if sep2 else tail).strip()
-
-
 def main():
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--model_id", default="google/gemma-3-1b-it")
-    ap.add_argument("--english", default="The weather is nice today, but I forgot my umbrella.")
+    ap.add_argument("--english", default="I will visit Chennai next week for a conference.")
     ap.add_argument("--max_new_tokens", type=int, default=128)
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--no_generate", action="store_true", help="Skip generation and use --tamil as completion.")
-    ap.add_argument("--tamil", default="இன்று வானிலை நல்லதாக இருக்கிறது, ஆனால் நான் குடையை மறந்துவிட்டேன்.")
+    ap.add_argument("--tamil", default="அடுத்த வாரம் மாநாட்டிற்காக நான் சென்னைக்கு வருவேன்.")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cuda":
+        torch.set_float32_matmul_precision("high")
 
-    # 1) Build prompt
     prompt = make_gemma_prompt(args.english)
-    src_en = extract_english(prompt)
 
-    # 2) Optionally generate Tamil completion with Gemma
     if args.no_generate:
         completion_ta = args.tamil
     else:
@@ -93,81 +84,53 @@ def main():
 
     print("\n=== PROMPT (rendered) ===")
     print(prompt)
-    print("\n=== SOURCE ENGLISH ===")
-    print(src_en)
     print("\n=== GENERATED/PROVIDED TAMIL ===")
     print(completion_ta)
 
-    # 3) Load reward fn (this loads: COMET-DA + COMETKiwi + NLLB dual)
     reward_fn = CometDuPOReward(
         cycle_metric_name="Unbabel/wmt22-comet-da",
         qe_metric_name="Unbabel/wmt22-cometkiwi-da",
         dual_model_name="facebook/nllb-200-distilled-1.3B",
         w_cycle=0.7,
         w_qe=0.3,
-        normalize="linear",
+        normalize="identity",  # IMPORTANT FIX
         reward_device=device,
         dual_device=device,
         comet_batch_size=8,
         dual_dtype_bf16=(device == "cuda"),
+        dual_use_safetensors=True,
     )
 
-    # 4) Compute components (using the same internals as the reward class)
-    #    This avoids guessing TRL’s call format.
-    with torch.inference_mode():
-        # Backtranslate Ta->En
-        back_en = reward_fn.bt_tok  # just to make it obvious what we use
-        bt = reward_fn  # alias
+    comps = reward_fn.score_components([prompt], [completion_ta])
 
-        backtrans_en_list = bt._CometDuPOReward__dict__ if False else None  # no-op to keep linters quiet
+    back_en = comps["back_en"][0]
+    r_cycle_raw = comps["cycle_raw"][0]
+    r_cycle_norm = comps["cycle_norm"][0]
+    r_qe_raw = comps["qe_raw"][0]
+    r_qe_norm = comps["qe_norm"][0]
+    p_script = comps["penalty_script"][0]
+    p_len = comps["penalty_lenratio"][0]
+    p_tot = comps["penalty_total"][0]
 
-        # Use the class's own helper
-        back_en = bt.bt_tok  # tokenizer
-        back_model = bt.bt_model
-
-        # Call the module-level helper via the instance method route:
-        # (We use the public pipeline instead: invoke reward_fn once, then recompute detailed pieces.)
-        # Recompute pieces directly for printing:
-        from rewards_en_ta_dupo import _nllb_backtranslate_ta_to_en, _script_penalty, _length_ratio_penalty
-
-        backtrans_en = _nllb_backtranslate_ta_to_en(
-            back_model, back_en, [completion_ta], device=torch.device(device)
-        )[0]
-
-        # Cycle raw (COMET-DA expects src, mt, ref)
-        cycle_data = [{"src": src_en, "mt": backtrans_en, "ref": src_en}]
-        r_cycle_raw = bt._predict_scores(bt.comet_cycle, cycle_data)[0].item()
-        r_cycle_norm = bt._normalize(torch.tensor([r_cycle_raw]))[0].item()
-
-        # QE raw (Kiwi expects src, mt)
-        qe_data = [{"src": src_en, "mt": completion_ta}]
-        r_qe_raw = bt._predict_scores(bt.comet_qe, qe_data)[0].item()
-        r_qe_norm = bt._normalize(torch.tensor([r_qe_raw]))[0].item()
-
-        # Penalties
-        p_script = bt.penalty_weight_script * _script_penalty(completion_ta)
-        p_len = bt.penalty_weight_lenratio * _length_ratio_penalty(src_en, completion_ta)
-        penalty_total = p_script + p_len
-
-        # Total (same formula as reward_fn)
-        total = bt.w_cycle * r_cycle_norm + bt.w_qe * r_qe_norm - penalty_total
-        total = max(0.0, min(1.0, total))
-
-        # Sanity: also call the reward_fn as TRL would
-        total_via_call = bt([prompt], [completion_ta])[0]
+    total_manual = max(
+        0.0,
+        min(1.0, 0.7 * r_cycle_norm + 0.3 * r_qe_norm - p_tot),
+    )
+    total_call = reward_fn([prompt], [completion_ta])[0]
 
     print("\n=== BACK-TRANSLATED ENGLISH (Ta->En via NLLB) ===")
-    print(backtrans_en)
+    print(back_en)
 
     print("\n=== REWARD BREAKDOWN ===")
-    print(f"Cycle (COMET-DA) raw:        {r_cycle_raw: .4f}")
-    print(f"Cycle (COMET-DA) normalized: {r_cycle_norm: .4f}")
-    print(f"QE (COMETKiwi) raw:          {r_qe_raw: .4f}")
-    print(f"QE (COMETKiwi) normalized:   {r_qe_norm: .4f}")
-    print(f"Penalty script:              {p_script: .4f}")
-    print(f"Penalty length-ratio:        {p_len: .4f}")
-    print(f"Total (manual):              {total: .4f}")
-    print(f"Total (reward_fn __call__):  {total_via_call: .4f}")
+    print(f"Cycle (COMET-DA) raw:         {r_cycle_raw: .4f}")
+    print(f"Cycle (COMET-DA) normalized:  {r_cycle_norm: .4f}   (identity clamp)")
+    print(f"QE (COMETKiwi) raw:           {r_qe_raw: .4f}")
+    print(f"QE (COMETKiwi) normalized:    {r_qe_norm: .4f}   (identity clamp)")
+    print(f"Penalty script:               {p_script: .4f}")
+    print(f"Penalty length-ratio:         {p_len: .4f}")
+    print(f"Penalty total:                {p_tot: .4f}")
+    print(f"Total (manual):               {total_manual: .4f}")
+    print(f"Total (reward_fn __call__):   {total_call: .4f}")
 
 
 if __name__ == "__main__":

@@ -2,13 +2,17 @@
 # DuPO-style compound reward:
 #   cycle (COMET-DA, reference-based) + QE/fluency (COMETKiwi-DA, reference-free)
 # with oracle dual back-translation (NLLB Ta->En, frozen)
+#
+# Normalization FIX:
+#   default normalize="identity" => clamp raw COMET scores to [0, 1]
+#   (your logs show wmt22-comet-da and wmt22-cometkiwi-da already output in [0,1]-ish)
 
 from __future__ import annotations
 
 import math
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Sequence, Union, Optional
+from typing import Any, Dict, List, Sequence, Union
 
 import torch
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
@@ -45,7 +49,6 @@ def _to_text(x: Any) -> str:
     if isinstance(x, str):
         return x
     if isinstance(x, list) and len(x) > 0 and isinstance(x[0], dict):
-        # join all message contents in order
         return "\n".join(_content_to_text(m.get("content", "")) for m in x if isinstance(m, dict))
     return str(x)
 
@@ -53,26 +56,19 @@ def _to_text(x: Any) -> str:
 def _strip_control(text: str) -> str:
     text = text.replace("\u200b", "")
     text = _GEMMA_CTRL.sub("", text)
-    # remove repeated whitespace/newlines
     return " ".join(text.split()).strip()
 
 
 def _extract_english_from_prompt(prompt_text: str) -> str:
     """
-    Extracts the *last* 'English:' ... 'Tamil:' block to avoid accidental earlier occurrences.
+    Extract the last 'English:' ... 'Tamil:' block (safer than split).
     Falls back to full prompt if markers not found.
     """
-    t = prompt_text
-    # rpartition is safer than split if "English:" appears elsewhere
-    head, sep, tail = t.rpartition("English:")
-    if sep:
-        en_block = tail
-        # stop at Tamil:
-        en, sep2, _ = en_block.partition("Tamil:")
-        if sep2:
-            return en.strip()
-        return en_block.strip()
-    return t.strip()
+    head, sep, tail = prompt_text.rpartition("English:")
+    if not sep:
+        return prompt_text.strip()
+    en, sep2, _ = tail.partition("Tamil:")
+    return (en if sep2 else tail).strip()
 
 
 @torch.inference_mode()
@@ -105,13 +101,17 @@ def _nllb_backtranslate_ta_to_en(
     return [_strip_control(s) for s in out]
 
 
-def _norm_linear_clip(x: torch.Tensor) -> torch.Tensor:
-    # Common heuristic for COMET-ish scores: map ~[-1, +1] to [0, 1]
-    return torch.clamp((x + 1.0) / 2.0, 0.0, 1.0)
+def _norm_identity_clamp01(x: torch.Tensor) -> torch.Tensor:
+    return torch.clamp(x, 0.0, 1.0)
 
 
 def _norm_sigmoid(x: torch.Tensor) -> torch.Tensor:
     return torch.sigmoid(x)
+
+
+def _norm_linear_minus1_plus1_to_01(x: torch.Tensor) -> torch.Tensor:
+    # For metrics that genuinely output ~[-1, +1]
+    return torch.clamp((x + 1.0) / 2.0, 0.0, 1.0)
 
 
 def _length_ratio_penalty(src_en: str, mt_ta: str) -> float:
@@ -135,9 +135,9 @@ class CometDuPOReward:
     # Dual/oracle backtranslation
     dual_model_name: str = "facebook/nllb-200-distilled-1.3B"
 
-    # Metric split (your Fix #1)
-    cycle_metric_name: str = "Unbabel/wmt22-comet-da"          # reference-based
-    qe_metric_name: str = "Unbabel/wmt22-cometkiwi-da"         # reference-free
+    # Metric split
+    cycle_metric_name: str = "Unbabel/wmt22-comet-da"       # reference-based
+    qe_metric_name: str = "Unbabel/wmt22-cometkiwi-da"      # reference-free
 
     # weights
     w_cycle: float = 0.7
@@ -147,17 +147,18 @@ class CometDuPOReward:
     penalty_weight_script: float = 0.10
     penalty_weight_lenratio: float = 0.05
 
-    # normalization: "sigmoid" or "linear"
-    normalize: str = "linear"
+    # normalization: "identity" (recommended), "sigmoid", "linear"
+    normalize: str = "identity"
 
-    # devices (best-effort; COMET .predict device selection depends on comet version)
+    # devices
     reward_device: str = "cuda"
     dual_device: str = "cuda"
 
     comet_batch_size: int = 16
 
-    # If you ever need memory relief on a single GPU, you can set this True to keep NLLB in bf16
+    # dual dtype and safe loading
     dual_dtype_bf16: bool = True
+    dual_use_safetensors: bool = True
 
     def __post_init__(self) -> None:
         self._reward_device = torch.device(self.reward_device)
@@ -181,25 +182,15 @@ class CometDuPOReward:
 
         # --- Load dual back-translation model (frozen) ---
         self.bt_tok = AutoTokenizer.from_pretrained(self.dual_model_name, use_fast=True)
-
         dtype = torch.bfloat16 if (self.dual_dtype_bf16 and self._dual_device.type == "cuda") else None
 
-        try:
-            # Force safetensors to avoid torch.load(.bin) restriction on torch<2.6
-            self.bt_model = AutoModelForSeq2SeqLM.from_pretrained(
-                self.dual_model_name,
-                dtype=dtype,                 # torch_dtype is deprecated in your setup
-                use_safetensors=True,
-                low_cpu_mem_usage=True,
-            )
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to load dual model '{self.dual_model_name}' with safetensors.\n"
-                f"To proceed, either:\n"
-                f"  1) ensure the repo has a *.safetensors weight file (preferred), or\n"
-                f"  2) upgrade torch to >= 2.6 to allow loading *.bin safely.\n"
-                f"Original error: {repr(e)}"
-            )
+        # IMPORTANT: use_safetensors avoids torch.load(.bin) restrictions on torch<2.6
+        self.bt_model = AutoModelForSeq2SeqLM.from_pretrained(
+            self.dual_model_name,
+            dtype=dtype,  # torch_dtype is deprecated in your environment
+            use_safetensors=self.dual_use_safetensors,
+            low_cpu_mem_usage=True,
+        )
 
         self.bt_model.to(self._dual_device)
         self.bt_model.eval()
@@ -212,9 +203,6 @@ class CometDuPOReward:
         Tries multiple signatures and extracts scores.
         """
         out = None
-
-        # Try to steer to GPU if available; API differs by COMET versions.
-        # If your COMET build ignores device placement, it will still work (just may run on default GPU/CPU).
         try:
             out = metric.predict(
                 data,
@@ -239,9 +227,56 @@ class CometDuPOReward:
         return torch.tensor(scores, dtype=torch.float32)
 
     def _normalize(self, x: torch.Tensor) -> torch.Tensor:
+        if self.normalize == "identity":
+            return _norm_identity_clamp01(x)
         if self.normalize == "sigmoid":
             return _norm_sigmoid(x)
-        return _norm_linear_clip(x)
+        if self.normalize == "linear":
+            return _norm_linear_minus1_plus1_to_01(x)
+        raise ValueError(f"Unknown normalize={self.normalize!r}. Use 'identity', 'sigmoid', or 'linear'.")
+
+    def score_components(self, prompt_texts: List[str], ta_hyps: List[str]) -> Dict[str, Any]:
+        """
+        Convenience helper for debugging (not used by TRL directly).
+        Returns raw + normalized components and penalties.
+        """
+        sources_en = [_extract_english_from_prompt(t) for t in prompt_texts]
+        ta_hyps = [_strip_control(c) for c in ta_hyps]
+
+        back_en = _nllb_backtranslate_ta_to_en(
+            self.bt_model, self.bt_tok, ta_hyps, device=self._dual_device
+        )
+
+        cycle_data = [{"src": s, "mt": b, "ref": s} for s, b in zip(sources_en, back_en)]
+        r_cycle_raw = self._predict_scores(self.comet_cycle, cycle_data)
+        r_cycle = self._normalize(r_cycle_raw)
+
+        qe_data = [{"src": s, "mt": t} for s, t in zip(sources_en, ta_hyps)]
+        r_qe_raw = self._predict_scores(self.comet_qe, qe_data)
+        r_qe = self._normalize(r_qe_raw)
+
+        penalties = []
+        p_script = []
+        p_len = []
+        for s, t in zip(sources_en, ta_hyps):
+            ps = self.penalty_weight_script * _script_penalty(t)
+            pl = self.penalty_weight_lenratio * _length_ratio_penalty(s, t)
+            p_script.append(ps)
+            p_len.append(pl)
+            penalties.append(ps + pl)
+
+        return {
+            "sources_en": sources_en,
+            "ta_hyps": ta_hyps,
+            "back_en": back_en,
+            "cycle_raw": r_cycle_raw.detach().cpu().tolist(),
+            "cycle_norm": r_cycle.detach().cpu().tolist(),
+            "qe_raw": r_qe_raw.detach().cpu().tolist(),
+            "qe_norm": r_qe.detach().cpu().tolist(),
+            "penalty_script": p_script,
+            "penalty_lenratio": p_len,
+            "penalty_total": penalties,
+        }
 
     def __call__(
         self,
@@ -249,40 +284,14 @@ class CometDuPOReward:
         completions: Sequence[CompletionType],
         **kwargs: Any,
     ) -> List[float]:
-        # 1) Convert to plain text
         prompt_texts = [_to_text(p) for p in prompts]
-        comp_texts = [_to_text(c) for c in completions]
-        ta_hyps = [_strip_control(c) for c in comp_texts]
+        ta_hyps = [_to_text(c) for c in completions]
+        comps = self.score_components(prompt_texts, ta_hyps)
 
-        # 2) Extract English sources from prompt
-        sources_en = [_extract_english_from_prompt(t) for t in prompt_texts]
+        r_cycle = torch.tensor(comps["cycle_norm"], dtype=torch.float32)
+        r_qe = torch.tensor(comps["qe_norm"], dtype=torch.float32)
+        penalties = torch.tensor(comps["penalty_total"], dtype=torch.float32)
 
-        # 3) Dual/oracle: backtranslate Tamil -> English
-        back_en = _nllb_backtranslate_ta_to_en(
-            self.bt_model, self.bt_tok, ta_hyps, device=self._dual_device
-        )
-
-        # 4) Cycle reward: COMET-DA with reference
-        cycle_data = [{"src": s, "mt": b, "ref": s} for s, b in zip(sources_en, back_en)]
-        r_cycle_raw = self._predict_scores(self.comet_cycle, cycle_data)
-
-        # 5) QE reward: COMETKiwi (reference-free)
-        qe_data = [{"src": s, "mt": t} for s, t in zip(sources_en, ta_hyps)]
-        r_qe_raw = self._predict_scores(self.comet_qe, qe_data)
-
-        # 6) Normalize + combine
-        r_cycle = self._normalize(r_cycle_raw)
-        r_qe = self._normalize(r_qe_raw)
-        total = self.w_cycle * r_cycle + self.w_qe * r_qe
-
-        # 7) Penalties
-        penalties = []
-        for s, t in zip(sources_en, ta_hyps):
-            p = 0.0
-            p += self.penalty_weight_script * _script_penalty(t)
-            p += self.penalty_weight_lenratio * _length_ratio_penalty(s, t)
-            penalties.append(p)
-
-        total = total - torch.tensor(penalties, dtype=torch.float32)
-        total = torch.clamp(total, min=0.0, max=1.0)
+        total = self.w_cycle * r_cycle + self.w_qe * r_qe - penalties
+        total = torch.clamp(total, 0.0, 1.0)
         return total.detach().cpu().tolist()
