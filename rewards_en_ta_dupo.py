@@ -1,10 +1,10 @@
-# rewards_en_ta_dupo.py (FULL CLASS with __name__ added)
+# rewards_en_ta_dupo.py
 from __future__ import annotations
 
 import math
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Sequence, Union
+from typing import Any, Dict, List, Sequence, Union, Optional
 
 import torch
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
@@ -125,6 +125,9 @@ class CometDuPOReward:
     dual_dtype_bf16: bool = True
     dual_use_safetensors: bool = True
 
+    # ---- logging state (used by callback) ----
+    last_log: Optional[Dict[str, float]] = None
+
     @property
     def __name__(self) -> str:
         # TRL expects reward_funcs[i].__name__
@@ -151,7 +154,7 @@ class CometDuPOReward:
 
         self.bt_model = AutoModelForSeq2SeqLM.from_pretrained(
             self.dual_model_name,
-            dtype=dtype,  # avoids torch_dtype deprecation warning in your env
+            dtype=dtype,  # avoids torch_dtype deprecation in your env
             use_safetensors=self.dual_use_safetensors,
             low_cpu_mem_usage=True,
         ).to(self._dual_device).eval()
@@ -187,46 +190,7 @@ class CometDuPOReward:
     def _normalize(self, x: torch.Tensor) -> torch.Tensor:
         if self.normalize == "identity":
             return _norm_identity_clamp01(x)
-        raise ValueError("This build expects normalize='identity'.")
-
-    def score_components(self, prompt_texts: List[str], ta_hyps: List[str]) -> Dict[str, Any]:
-        sources_en = [_extract_english_from_prompt(t) for t in prompt_texts]
-        ta_hyps = [_strip_control(c) for c in ta_hyps]
-
-        back_en = _nllb_backtranslate_ta_to_en(
-            self.bt_model, self.bt_tok, ta_hyps, device=self._dual_device
-        )
-
-        cycle_data = [{"src": s, "mt": b, "ref": s} for s, b in zip(sources_en, back_en)]
-        r_cycle_raw = self._predict_scores(self.comet_cycle, cycle_data)
-        r_cycle = self._normalize(r_cycle_raw)
-
-        qe_data = [{"src": s, "mt": t} for s, t in zip(sources_en, ta_hyps)]
-        r_qe_raw = self._predict_scores(self.comet_qe, qe_data)
-        r_qe = self._normalize(r_qe_raw)
-
-        penalties = []
-        p_script = []
-        p_len = []
-        for s, t in zip(sources_en, ta_hyps):
-            ps = self.penalty_weight_script * _script_penalty(t)
-            pl = self.penalty_weight_lenratio * _length_ratio_penalty(s, t)
-            p_script.append(ps)
-            p_len.append(pl)
-            penalties.append(ps + pl)
-
-        return {
-            "sources_en": sources_en,
-            "ta_hyps": ta_hyps,
-            "back_en": back_en,
-            "cycle_raw": r_cycle_raw.detach().cpu().tolist(),
-            "cycle_norm": r_cycle.detach().cpu().tolist(),
-            "qe_raw": r_qe_raw.detach().cpu().tolist(),
-            "qe_norm": r_qe.detach().cpu().tolist(),
-            "penalty_script": p_script,
-            "penalty_lenratio": p_len,
-            "penalty_total": penalties,
-        }
+        raise ValueError("Use normalize='identity' for these COMET models.")
 
     def __call__(
         self,
@@ -235,13 +199,47 @@ class CometDuPOReward:
         **kwargs: Any,
     ) -> List[float]:
         prompt_texts = [_to_text(p) for p in prompts]
-        ta_hyps = [_to_text(c) for c in completions]
-        comps = self.score_components(prompt_texts, ta_hyps)
+        ta_hyps = [_strip_control(_to_text(c)) for c in completions]
+        sources_en = [_extract_english_from_prompt(t) for t in prompt_texts]
 
-        r_cycle = torch.tensor(comps["cycle_norm"], dtype=torch.float32)
-        r_qe = torch.tensor(comps["qe_norm"], dtype=torch.float32)
-        penalties = torch.tensor(comps["penalty_total"], dtype=torch.float32)
+        # backtranslation
+        back_en = _nllb_backtranslate_ta_to_en(
+            self.bt_model, self.bt_tok, ta_hyps, device=self._dual_device
+        )
+
+        # cycle (COMET-DA)
+        cycle_data = [{"src": s, "mt": b, "ref": s} for s, b in zip(sources_en, back_en)]
+        r_cycle_raw = self._predict_scores(self.comet_cycle, cycle_data)
+        r_cycle = self._normalize(r_cycle_raw)
+
+        # QE (COMETKiwi)
+        qe_data = [{"src": s, "mt": t} for s, t in zip(sources_en, ta_hyps)]
+        r_qe_raw = self._predict_scores(self.comet_qe, qe_data)
+        r_qe = self._normalize(r_qe_raw)
+
+        # penalties
+        p_script_vals = []
+        p_len_vals = []
+        for s, t in zip(sources_en, ta_hyps):
+            p_script_vals.append(self.penalty_weight_script * _script_penalty(t))
+            p_len_vals.append(self.penalty_weight_lenratio * _length_ratio_penalty(s, t))
+
+        penalties = torch.tensor(p_script_vals, dtype=torch.float32) + torch.tensor(p_len_vals, dtype=torch.float32)
 
         total = self.w_cycle * r_cycle + self.w_qe * r_qe - penalties
         total = torch.clamp(total, 0.0, 1.0)
+
+        # ---- store stats for W&B callback ----
+        self.last_log = {
+            "reward/total_mean": float(total.mean().item()),
+            "reward/total_std": float(total.std(unbiased=False).item()) if total.numel() > 1 else 0.0,
+            "reward/cycle_mean": float(r_cycle.mean().item()),
+            "reward/qe_mean": float(r_qe.mean().item()),
+            "reward/cycle_raw_mean": float(r_cycle_raw.mean().item()),
+            "reward/qe_raw_mean": float(r_qe_raw.mean().item()),
+            "reward/penalty_script_mean": float(torch.tensor(p_script_vals).mean().item()),
+            "reward/penalty_len_mean": float(torch.tensor(p_len_vals).mean().item()),
+            "reward/penalty_total_mean": float(penalties.mean().item()),
+        }
+
         return total.detach().cpu().tolist()

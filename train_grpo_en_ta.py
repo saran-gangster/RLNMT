@@ -105,8 +105,8 @@ def setup_wandb(cfg: RunCfg) -> None:
         os.environ["WANDB_API_KEY"] = cfg.wandb_api_key
 
         # Optional explicit login (more reliable than relying on env alone)
-        import wandb
-        wandb.login(key=cfg.wandb_api_key, relogin=True)
+        import wandb_reward_callback
+        wandb_reward_callback.login(key=cfg.wandb_api_key, relogin=True)
 
 
 def main() -> None:
@@ -171,6 +171,8 @@ def main() -> None:
         train_dataset=ds,
         processing_class=tok,
     )
+    from wandb_reward_callback import WandbRewardCallback
+    trainer.add_callback(WandbRewardCallback(reward_fn=reward_fn, log_every=1, ema_alpha=0.05))
 
     trainer.train()
     trainer.save_model(cfg.output_dir)
