@@ -168,83 +168,48 @@ def materialize_opus100_train(cfg: RunCfg) -> Dataset:
 
 
 def download_flores200(local_dir: str) -> None:
-    """Download FLORES-200 dataset from official GitHub repo."""
-    import subprocess
+    """Download FLORES-200 dataset from official NLLB tar.gz."""
+    import tarfile
+    import urllib.request
     
-    if os.path.exists(local_dir):
-        print(f"[flores] Found existing directory: {local_dir}")
+    flores_data_dir = os.path.join(local_dir, "flores200_dataset")
+    if os.path.exists(flores_data_dir):
+        print(f"[flores] Found existing directory: {flores_data_dir}")
         return
     
     print(f"[flores] Downloading FLORES-200 to {local_dir}")
     os.makedirs(local_dir, exist_ok=True)
     
-    # Clone the official FLORES repo (sparse checkout for just the data)
-    repo_url = "https://github.com/facebookresearch/flores.git"
-    temp_dir = f"{local_dir}_temp"
+    tar_url = "https://dl.fbaipublicfiles.com/nllb/flores200_dataset.tar.gz"
+    tar_path = os.path.join(local_dir, "flores200_dataset.tar.gz")
     
     try:
-        subprocess.run(
-            ["git", "clone", "--depth", "1", "--filter=blob:none", "--sparse", repo_url, temp_dir],
-            check=True,
-            capture_output=True,
-        )
-        subprocess.run(
-            ["git", "-C", temp_dir, "sparse-checkout", "set", "flores200"],
-            check=True,
-            capture_output=True,
-        )
+        print(f"[flores] Downloading from {tar_url}...")
+        urllib.request.urlretrieve(tar_url, tar_path)
+        print(f"[flores] Extracting {tar_path}...")
         
-        # Move the data files to local_dir
-        flores_data = os.path.join(temp_dir, "flores200")
-        if os.path.exists(flores_data):
-            subprocess.run(["cp", "-r", flores_data, local_dir], check=True)
-        else:
-            # Fallback: just copy everything
-            subprocess.run(["cp", "-r", f"{temp_dir}/.", local_dir], check=True)
+        with tarfile.open(tar_path, "r:gz") as tar:
+            tar.extractall(path=local_dir)
         
-        # Cleanup temp
-        subprocess.run(["rm", "-rf", temp_dir], check=True)
-        print(f"[flores] Download complete: {local_dir}")
-    except subprocess.CalledProcessError as e:
-        print(f"[flores] Git clone failed: {e}")
-        print(f"[flores] Attempting direct download of TSV files...")
-        
-        # Fallback: download individual TSV files from GitHub
-        import urllib.request
-        
-        base_url = "https://raw.githubusercontent.com/facebookresearch/flores/main/flores200"
-        for split in ["dev", "devtest"]:
-            for lang in ["eng_Latn", "tam_Taml"]:
-                url = f"{base_url}/{split}/{lang}.{split}"
-                output_path = os.path.join(local_dir, f"{lang}.{split}")
-                os.makedirs(os.path.dirname(output_path), exist_ok=True)
-                try:
-                    urllib.request.urlretrieve(url, output_path)
-                    print(f"[flores] Downloaded: {lang}.{split}")
-                except Exception as dl_err:
-                    print(f"[flores] Failed to download {url}: {dl_err}")
+        # Cleanup tar file
+        os.remove(tar_path)
+        print(f"[flores] Download complete: {flores_data_dir}")
+    except Exception as e:
+        raise RuntimeError(f"Failed to download FLORES-200: {e}")
 
 
 def load_flores200_local(cfg: RunCfg) -> List[Tuple[str, str]]:
     """Load FLORES-200 from local files."""
     download_flores200(cfg.flores_local_dir)
     
-    # Look for the TSV files
-    en_file = None
-    ta_file = None
+    # FLORES-200 structure: flores200_dataset/{split}/{lang}.{split}
+    flores_base = os.path.join(cfg.flores_local_dir, "flores200_dataset", cfg.flores_split)
+    en_file = os.path.join(flores_base, f"{cfg.flores_lang_en}.{cfg.flores_split}")
+    ta_file = os.path.join(flores_base, f"{cfg.flores_lang_ta}.{cfg.flores_split}")
     
-    # Search in local_dir and subdirectories
-    for root, dirs, files in os.walk(cfg.flores_local_dir):
-        for f in files:
-            if f == f"{cfg.flores_lang_en}.{cfg.flores_split}":
-                en_file = os.path.join(root, f)
-            if f == f"{cfg.flores_lang_ta}.{cfg.flores_split}":
-                ta_file = os.path.join(root, f)
-    
-    if not en_file or not ta_file:
+    if not os.path.exists(en_file) or not os.path.exists(ta_file):
         raise FileNotFoundError(
-            f"Could not find FLORES files: {cfg.flores_lang_en}.{cfg.flores_split} "
-            f"or {cfg.flores_lang_ta}.{cfg.flores_split} in {cfg.flores_local_dir}"
+            f"Could not find FLORES files:\n  EN: {en_file}\n  TA: {ta_file}"
         )
     
     print(f"[flores] Loading from:\n  EN: {en_file}\n  TA: {ta_file}")
