@@ -47,7 +47,7 @@ class RunCfg:
 
     # Eval / benchmarking
     num_eval_samples: int = 64
-    eval_batch_size: int = 4
+    eval_batch_size: int = 12
     eval_temperature: float = 0.8
     eval_max_new_tokens: int = 256
     eval_seed: int = 1234
@@ -305,6 +305,7 @@ def main() -> None:
         max_steps=cfg.max_steps,
         learning_rate=cfg.lr,
         beta=cfg.kl_beta,
+        generation_batch_size=cfg.group_size,
         per_device_train_batch_size=1,
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
         num_generations=cfg.group_size,
