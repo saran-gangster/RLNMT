@@ -52,9 +52,10 @@ class RunCfg:
     save_total_limit: int = 2
     resume_from_checkpoint: str = ""
 
-    # Eval: FLORES-200 eng_Latn-tam_Taml
-    flores_dataset_candidates: Tuple[str, ...] = ("openlanguagedata/flores_plus", "facebook/flores", "gsarti/flores_101")
-    flores_pair_config: str = "eng_Latn-tam_Taml"
+    # Eval: FLORES-200 from local files
+    flores_local_dir: str = "./flores200_dataset"
+    flores_lang_en: str = "eng_Latn"
+    flores_lang_ta: str = "tam_Taml"
     flores_split: str = "devtest"  # "dev" or "devtest"
     num_eval_samples: int = 128
     eval_batch_size: int = 16
@@ -166,63 +167,126 @@ def materialize_opus100_train(cfg: RunCfg) -> Dataset:
     return Dataset.from_list(rows)
 
 
-def load_flores200_stream(cfg: RunCfg):
-    last_err: Optional[Exception] = None
-    for ds_id in cfg.flores_dataset_candidates:
-        try:
-            # Try with config first
-            return _load_dataset_trust(
-                ds_id,
-                cfg.flores_pair_config,
-                split=cfg.flores_split,
-                streaming=True,
-            )
-        except Exception as e1:
-            try:
-                # Try without config (some datasets don't have pair configs)
-                return _load_dataset_trust(
-                    ds_id,
-                    split=cfg.flores_split,
-                    streaming=True,
-                )
-            except Exception as e2:
-                last_err = e2
-                continue
+def download_flores200(local_dir: str) -> None:
+    """Download FLORES-200 dataset from official GitHub repo."""
+    import subprocess
+    
+    if os.path.exists(local_dir):
+        print(f"[flores] Found existing directory: {local_dir}")
+        return
+    
+    print(f"[flores] Downloading FLORES-200 to {local_dir}")
+    os.makedirs(local_dir, exist_ok=True)
+    
+    # Clone the official FLORES repo (sparse checkout for just the data)
+    repo_url = "https://github.com/facebookresearch/flores.git"
+    temp_dir = f"{local_dir}_temp"
+    
+    try:
+        subprocess.run(
+            ["git", "clone", "--depth", "1", "--filter=blob:none", "--sparse", repo_url, temp_dir],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", temp_dir, "sparse-checkout", "set", "flores200"],
+            check=True,
+            capture_output=True,
+        )
+        
+        # Move the data files to local_dir
+        flores_data = os.path.join(temp_dir, "flores200")
+        if os.path.exists(flores_data):
+            subprocess.run(["cp", "-r", flores_data, local_dir], check=True)
+        else:
+            # Fallback: just copy everything
+            subprocess.run(["cp", "-r", f"{temp_dir}/.", local_dir], check=True)
+        
+        # Cleanup temp
+        subprocess.run(["rm", "-rf", temp_dir], check=True)
+        print(f"[flores] Download complete: {local_dir}")
+    except subprocess.CalledProcessError as e:
+        print(f"[flores] Git clone failed: {e}")
+        print(f"[flores] Attempting direct download of TSV files...")
+        
+        # Fallback: download individual TSV files from GitHub
+        import urllib.request
+        
+        base_url = "https://raw.githubusercontent.com/facebookresearch/flores/main/flores200"
+        for split in ["dev", "devtest"]:
+            for lang in ["eng_Latn", "tam_Taml"]:
+                url = f"{base_url}/{split}/{lang}.{split}"
+                output_path = os.path.join(local_dir, f"{lang}.{split}")
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                try:
+                    urllib.request.urlretrieve(url, output_path)
+                    print(f"[flores] Downloaded: {lang}.{split}")
+                except Exception as dl_err:
+                    print(f"[flores] Failed to download {url}: {dl_err}")
 
-    raise RuntimeError(
-        f"Could not load FLORES-200 from any of: {cfg.flores_dataset_candidates} "
-        f"with config={cfg.flores_pair_config} split={cfg.flores_split}. Last error: {last_err}"
-    )
+
+def load_flores200_local(cfg: RunCfg) -> List[Tuple[str, str]]:
+    """Load FLORES-200 from local files."""
+    download_flores200(cfg.flores_local_dir)
+    
+    # Look for the TSV files
+    en_file = None
+    ta_file = None
+    
+    # Search in local_dir and subdirectories
+    for root, dirs, files in os.walk(cfg.flores_local_dir):
+        for f in files:
+            if f == f"{cfg.flores_lang_en}.{cfg.flores_split}":
+                en_file = os.path.join(root, f)
+            if f == f"{cfg.flores_lang_ta}.{cfg.flores_split}":
+                ta_file = os.path.join(root, f)
+    
+    if not en_file or not ta_file:
+        raise FileNotFoundError(
+            f"Could not find FLORES files: {cfg.flores_lang_en}.{cfg.flores_split} "
+            f"or {cfg.flores_lang_ta}.{cfg.flores_split} in {cfg.flores_local_dir}"
+        )
+    
+    print(f"[flores] Loading from:\n  EN: {en_file}\n  TA: {ta_file}")
+    
+    with open(en_file, "r", encoding="utf-8") as f:
+        en_lines = [line.strip() for line in f if line.strip()]
+    
+    with open(ta_file, "r", encoding="utf-8") as f:
+        ta_lines = [line.strip() for line in f if line.strip()]
+    
+    if len(en_lines) != len(ta_lines):
+        raise ValueError(
+            f"Mismatched line counts: EN={len(en_lines)}, TA={len(ta_lines)}"
+        )
+    
+    return list(zip(en_lines, ta_lines))
 
 
 def materialize_flores_eval(cfg: RunCfg) -> Dataset:
-    stream = load_flores200_stream(cfg)
-
+    pairs = load_flores200_local(cfg)
+    
     rows: List[Dict[str, str]] = []
-    take_cap = cfg.num_eval_samples * 5
-
-    for ex in stream.take(take_cap):
-        # Try different column name formats
-        en = (ex.get("sentence_eng_Latn") or ex.get("eng_Latn") or ex.get("en") or "").strip()
-        ta = (ex.get("sentence_tam_Taml") or ex.get("tam_Taml") or ex.get("ta") or "").strip()
-        if not en or not ta:
-            continue
-
+    for en, ta in pairs[: cfg.num_eval_samples]:
         en = " ".join(en.split()).strip()
         ta = " ".join(ta.split()).strip()
-
+        
+        if not en or not ta:
+            continue
         if len(en) < cfg.min_chars:
             continue
+        
+        # Truncate English if too long
         en = en[: cfg.max_chars].strip()
         if len(en) < cfg.min_chars:
             continue
-
+        
         rows.append({"prompt": make_gemma_prompt(en), "ref_ta": ta})
-        if len(rows) >= cfg.num_eval_samples:
-            break
-
+    
     if not rows:
-        raise RuntimeError("No FLORES eval examples materialized; check dataset/config/split.")
+        raise RuntimeError("No FLORES eval examples materialized.")
+    
+    print(f"[flores] Materialized {len(rows)} eval examples")
     return Dataset.from_list(rows)
 
 
