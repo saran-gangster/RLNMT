@@ -50,9 +50,6 @@ def _strip_control(text: str) -> str:
 
 
 def _extract_english_from_prompt(prompt_text: str) -> str:
-    # matches your prompt format:
-    # English: ...
-    # Tamil:
     head, sep, tail = prompt_text.rpartition("English:")
     if not sep:
         return prompt_text.strip()
@@ -67,43 +64,56 @@ def _length_ratio_penalty(src_en: str, mt_ta: str) -> float:
     return float(abs(math.log(ratio)))
 
 
-def _script_penalty(mt_ta: str) -> float:
-    p = 0.0
-    if _LATIN_RE.search(mt_ta or ""):
-        p += 1.0
-    if not _TAMIL_RE.search(mt_ta or ""):
-        p += 1.0
-    return p
+def _latin_tolerant_script_penalty(mt_ta: str, latin_frac_threshold: float = 0.35) -> float:
+    """
+    Penalize only if:
+      - no Tamil characters at all (strong penalty)
+      - or output is mostly Latin (fraction over threshold)
+    This avoids punishing valid tokens like 'svg', 'NASA', names, etc.
+    """
+    s = mt_ta or ""
+    has_tamil = bool(_TAMIL_RE.search(s))
+    has_latin = bool(_LATIN_RE.search(s))
+
+    if not has_tamil:
+        return 1.0  # must contain Tamil
+
+    if not has_latin:
+        return 0.0
+
+    # approximate latin fraction over letters
+    latin_chars = len(re.findall(r"[A-Za-z]", s))
+    tamil_chars = len(re.findall(r"[\u0B80-\u0BFF]", s))
+    denom = max(1, latin_chars + tamil_chars)
+    latin_frac = latin_chars / denom
+
+    if latin_frac <= latin_frac_threshold:
+        return 0.0
+    # scale up smoothly above threshold
+    return float(min(1.0, (latin_frac - latin_frac_threshold) / (1.0 - latin_frac_threshold)))
 
 
 @dataclass
 class CometRefQeReward:
-    """
-    Reference-based reward for EN->TA.
-
-    - r_ref: COMET-DA with (src=en, mt=ta_hyp, ref=ta_ref)  [best when you have gold Tamil]
-    - r_qe : COMETKiwi QE with (src=en, mt=ta_hyp)          [helps when ref is missing/noisy]
-
-    TRL will pass extra dataset columns to reward via **kwargs if present.
-    Put the reference Tamil in the dataset column name `ref_ta` (default here).
-    """
     ref_metric_name: str = "Unbabel/wmt22-comet-da"
     qe_metric_name: str = "Unbabel/wmt22-cometkiwi-da"
 
     w_ref: float = 0.85
     w_qe: float = 0.15
 
-    penalty_weight_script: float = 0.25
-    penalty_weight_lenratio: float = 0.05
+    penalty_weight_script: float = 0.08       # lowered because OPUS has legit Latin tokens
+    penalty_weight_lenratio: float = 0.03
 
-    # "auto": if scores go outside [0,1], squash with sigmoid; else clamp
-    normalize: str = "auto"
+    # "affine": map roughly [-1, 1] -> [0, 1] via 0.5*(x+1) then clamp
+    normalize: str = "affine"
 
     reward_device: str = "cuda"
     comet_batch_size: int = 64
 
-    # dataset column name for gold Tamil
     ref_key: str = "ref_ta"
+
+    # optional fallback index: prompt -> ref_ta
+    prompt_to_ref: Optional[Dict[str, str]] = None
 
     @property
     def __name__(self) -> str:
@@ -122,8 +132,20 @@ class CometRefQeReward:
             try:
                 m.to(self._reward_device)
             except Exception:
-                # some COMET versions handle device internally
                 pass
+
+    def index_references(self, prompts: Sequence[str], refs: Sequence[str]) -> None:
+        """
+        Build a fallback map so training still uses references even if TRL doesn't
+        pass ref_ta through kwargs.
+        """
+        m: Dict[str, str] = {}
+        for p, r in zip(prompts, refs):
+            ps = str(p)
+            # only keep first if duplicates occur
+            if ps not in m:
+                m[ps] = str(r)
+        self.prompt_to_ref = m
 
     def _predict_scores(self, metric, data: List[Dict[str, str]]) -> torch.Tensor:
         out = None
@@ -155,11 +177,13 @@ class CometRefQeReward:
         if self.normalize == "identity":
             return torch.clamp(x, 0.0, 1.0)
         if self.normalize == "auto":
-            # COMET scores are not guaranteed to be in [0,1]
             if (x.min().item() < 0.0) or (x.max().item() > 1.0):
                 x = torch.sigmoid(x)
             return torch.clamp(x, 0.0, 1.0)
-        raise ValueError("normalize must be 'identity' or 'auto'.")
+        if self.normalize == "affine":
+            # stable spread when raw scores are around [-1, 1]
+            return torch.clamp(0.5 * (x + 1.0), 0.0, 1.0)
+        raise ValueError("normalize must be 'identity', 'auto', or 'affine'.")
 
     @torch.inference_mode()
     def __call__(
@@ -172,27 +196,36 @@ class CometRefQeReward:
         ta_hyps = [_strip_control(_to_text(c)) for c in completions]
         src_en = [_extract_english_from_prompt(t) for t in prompt_texts]
 
-        # TRL usually passes extra dataset columns through kwargs (batched list-like).
-        ref_ta: Optional[Sequence[str]] = kwargs.get(self.ref_key, None)
+        # Get refs from kwargs if provided; else fallback to prompt_to_ref index.
+        ref_ta_in: Optional[Sequence[str]] = kwargs.get(self.ref_key, None)
+        if ref_ta_in is not None and len(ref_ta_in) == len(ta_hyps):
+            ta_refs = [_strip_control(str(r)) for r in ref_ta_in]
+        else:
+            ta_refs = []
+            if self.prompt_to_ref:
+                for p in prompt_texts:
+                    ta_refs.append(_strip_control(self.prompt_to_ref.get(p, "")))
+            else:
+                ta_refs = [""] * len(ta_hyps)
 
-        # Always compute QE
+        # QE always
         qe_data = [{"src": s, "mt": t} for s, t in zip(src_en, ta_hyps)]
         r_qe = self._normalize(self._predict_scores(self.comet_qe, qe_data))
 
-        # Reference-based COMET if ref is available
-        if ref_ta is not None and len(ref_ta) == len(ta_hyps):
-            ta_refs = [_strip_control(str(r)) for r in ref_ta]
+        # Reference-based COMET where refs exist; else 0.
+        has_ref_mask = torch.tensor([1.0 if (r and r.strip()) else 0.0 for r in ta_refs], dtype=torch.float32)
+        if has_ref_mask.sum().item() > 0:
             ref_data = [{"src": s, "mt": h, "ref": r} for s, h, r in zip(src_en, ta_hyps, ta_refs)]
-            r_ref = self._normalize(self._predict_scores(self.comet_ref, ref_data))
+            r_ref_all = self._normalize(self._predict_scores(self.comet_ref, ref_data))
+            r_ref = r_ref_all * has_ref_mask
         else:
-            # no ref => fall back to QE only
             r_ref = torch.zeros_like(r_qe)
 
         # penalties
         p_script_vals: List[float] = []
         p_len_vals: List[float] = []
         for s, t in zip(src_en, ta_hyps):
-            p_script_vals.append(self.penalty_weight_script * _script_penalty(t))
+            p_script_vals.append(self.penalty_weight_script * _latin_tolerant_script_penalty(t))
             p_len_vals.append(self.penalty_weight_lenratio * _length_ratio_penalty(s, t))
         penalties = torch.tensor(p_script_vals, dtype=torch.float32) + torch.tensor(p_len_vals, dtype=torch.float32)
 

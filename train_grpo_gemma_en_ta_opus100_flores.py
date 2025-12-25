@@ -506,6 +506,8 @@ def main() -> None:
         penalty_weight_script=0.25,
         penalty_weight_lenratio=0.05,
     )
+    
+    reward_fn.index_references(train_ds["prompt"], train_ds["ref_ta"])
 
     pre = benchmark_model(
         model=model,
