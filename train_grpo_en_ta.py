@@ -37,7 +37,7 @@ class RunCfg:
     # GRPO run
     output_dir: str = "./grpo_gemma_en_ta_ckpts"
     max_steps: int = 200
-    group_size: int = 4
+    group_size: int = 8
     temperature: float = 0.8
     max_new_tokens: int = 256
     lr: float = 1e-6

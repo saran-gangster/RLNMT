@@ -120,7 +120,7 @@ class CometDuPOReward:
 
     reward_device: str = "cuda"
     dual_device: str = "cuda"
-    comet_batch_size: int = 16
+    comet_batch_size: int = 64
 
     dual_dtype_bf16: bool = True
     dual_use_safetensors: bool = True
