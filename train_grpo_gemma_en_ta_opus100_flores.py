@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+import math
 import statistics
 from dataclasses import dataclass
 from typing import Any, Dict, List, Sequence, Tuple, Optional
@@ -27,6 +28,8 @@ class RunCfg:
     train_dataset_id: str = "Helsinki-NLP/opus-100"
     train_config: str = "en-ta"
     train_split: str = "train"
+
+    # ---- Small-data regime (2k–5k) ----
     num_train_samples: int = 3000
     shuffle_buffer: int = 10_000
 
@@ -36,31 +39,31 @@ class RunCfg:
 
     # GRPO
     output_dir: str = "./grpo_gemma_en_ta_opus100"
-    max_steps: int = 750
+    max_steps: int = 0  # 0 => auto: ceil(num_train_samples / gradient_accumulation_steps)
     group_size: int = 8
-    temperature: float = 0.7
-    max_new_tokens: int = 160
+    temperature: float = 0.6
+    max_new_tokens: int = 128
     lr: float = 5e-7
-    kl_beta: float = 0.12
+    kl_beta: float = 0.15
     gradient_accumulation_steps: int = 4
     seed: int = 42
     logging_steps: int = 10
-    save_steps: int = max_steps
+    save_steps: int = 0       # 0 => auto: save once at end
     save_total_limit: int = 2
     resume_from_checkpoint: str = ""
 
-    # Eval dataset: FLORES-200 eng_Latn-tam_Taml
+    # Eval: FLORES-200 eng_Latn-tam_Taml
     flores_dataset_candidates: Tuple[str, ...] = ("facebook/flores", "facebook/flores200", "Muennighoff/flores200")
     flores_pair_config: str = "eng_Latn-tam_Taml"
     flores_split: str = "devtest"  # "dev" or "devtest"
-    num_eval_samples: int = 256
+    num_eval_samples: int = 128
     eval_batch_size: int = 16
-    eval_max_new_tokens: int = 160
+    eval_max_new_tokens: int = 128
     eval_seed: int = 1234
 
-    # W&B: rely on HF/TRL (no manual wandb.init)
+    # W&B via HF/TRL only
     use_wandb: bool = True
-    wandb_api_key: str = ""  # optional
+    wandb_api_key: str = ""
     wandb_project: str = "rl-nmt-en-ta-dupo"
     wandb_entity: str = ""
     wandb_run_name: str = "gemma3-1b-it-grpo-opus100-en-ta"
@@ -108,28 +111,42 @@ def _strip_control(text: str) -> str:
 
 
 def _get_en_ta_from_opus(ex: Dict[str, Any]) -> Tuple[str, str]:
-    """
-    Handles both shapes:
-      1) {"translation": {"en": "...", "ta": "..."}}
-      2) {"en": "...", "ta": "..."}
-    """
+    # Handles both:
+    # 1) {"translation": {"en": "...", "ta": "..."}}
+    # 2) {"en": "...", "ta": "..."}
     if isinstance(ex.get("translation"), dict):
         en = ex["translation"].get("en", "") or ""
         ta = ex["translation"].get("ta", "") or ""
         return en, ta
-    en = ex.get("en", "") or ""
-    ta = ex.get("ta", "") or ""
-    return en, ta
+    return (ex.get("en", "") or ""), (ex.get("ta", "") or "")
+
+
+def _load_dataset_trust(*args, **kwargs):
+    """
+    Newer `datasets` requires `trust_remote_code=True` to run hub dataset scripts (like FLORES).
+    For older versions that don't accept it, we remove it.
+    """
+    try:
+        return load_dataset(*args, **kwargs)
+    except TypeError:
+        kwargs.pop("trust_remote_code", None)
+        return load_dataset(*args, **kwargs)
 
 
 def materialize_opus100_train(cfg: RunCfg) -> Dataset:
-    stream = load_dataset(cfg.train_dataset_id, cfg.train_config, split=cfg.train_split, streaming=True)
+    stream = _load_dataset_trust(
+        cfg.train_dataset_id,
+        cfg.train_config,
+        split=cfg.train_split,
+        streaming=True,
+        trust_remote_code=True,
+    )
 
     if cfg.shuffle_buffer and cfg.shuffle_buffer > 0:
         stream = stream.shuffle(seed=cfg.seed, buffer_size=cfg.shuffle_buffer)
 
     rows: List[Dict[str, str]] = []
-    take_cap = cfg.num_train_samples * 5
+    take_cap = cfg.num_train_samples * 8
 
     for ex in stream.take(take_cap):
         en, ta = _get_en_ta_from_opus(ex)
@@ -141,7 +158,6 @@ def materialize_opus100_train(cfg: RunCfg) -> Dataset:
         if len(en) < cfg.min_chars or len(en) > cfg.max_chars:
             continue
 
-        # Keep the ref out of the prompt; store in extra column for reward
         rows.append({"prompt": make_gemma_prompt(en), "ref_ta": ta})
         if len(rows) >= cfg.num_train_samples:
             break
@@ -151,22 +167,21 @@ def materialize_opus100_train(cfg: RunCfg) -> Dataset:
     return Dataset.from_list(rows)
 
 
-def _get_any(ex: Dict[str, Any], keys: Sequence[str]) -> str:
-    for k in keys:
-        v = ex.get(k, None)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return ""
-
-
 def load_flores200_stream(cfg: RunCfg):
     last_err: Optional[Exception] = None
     for ds_id in cfg.flores_dataset_candidates:
         try:
-            return load_dataset(ds_id, cfg.flores_pair_config, split=cfg.flores_split, streaming=True)
+            return _load_dataset_trust(
+                ds_id,
+                cfg.flores_pair_config,
+                split=cfg.flores_split,
+                streaming=True,
+                trust_remote_code=True,  # <-- fixes your crash
+            )
         except Exception as e:
             last_err = e
             continue
+
     raise RuntimeError(
         f"Could not load FLORES-200 from any of: {cfg.flores_dataset_candidates} "
         f"with config={cfg.flores_pair_config} split={cfg.flores_split}. Last error: {last_err}"
@@ -177,26 +192,18 @@ def materialize_flores_eval(cfg: RunCfg) -> Dataset:
     stream = load_flores200_stream(cfg)
 
     rows: List[Dict[str, str]] = []
-    take_cap = cfg.num_eval_samples * 3
+    take_cap = cfg.num_eval_samples * 5
 
     for ex in stream.take(take_cap):
-        # Common column names for paired FLORES configs
-        en = _get_any(ex, ["sentence_eng_Latn", "sentence_en", "eng", "English", "sentence"])
-        ta = _get_any(ex, ["sentence_tam_Taml", "sentence_ta", "tam", "Tamil"])
-
-        # If the config is paired, usually both exist; if not, skip.
+        # For paired config eng_Latn-tam_Taml, these are the common column names
+        en = (ex.get("sentence_eng_Latn") or "").strip()
+        ta = (ex.get("sentence_tam_Taml") or "").strip()
         if not en or not ta:
-            # Some builders put languages as sentence_{lang}
-            en = _get_any(ex, ["sentence_eng_Latn"])
-            ta = _get_any(ex, ["sentence_tam_Taml"])
-            if not en or not ta:
-                continue
+            continue
 
         en = " ".join(en.split()).strip()
         ta = " ".join(ta.split()).strip()
 
-        if not en or not ta:
-            continue
         if len(en) < cfg.min_chars:
             continue
         en = en[: cfg.max_chars].strip()
@@ -210,6 +217,15 @@ def materialize_flores_eval(cfg: RunCfg) -> Dataset:
     if not rows:
         raise RuntimeError("No FLORES eval examples materialized; check dataset/config/split.")
     return Dataset.from_list(rows)
+
+
+def _from_pretrained_with_dtype(model_id: str, dtype, device: str):
+    # Your env warns torch_dtype is deprecated, so prefer dtype=...
+    try:
+        return Gemma3ForCausalLM.from_pretrained(model_id, dtype=dtype).to(device)
+    except TypeError:
+        # fallback for older transformers
+        return Gemma3ForCausalLM.from_pretrained(model_id, torch_dtype=dtype).to(device)
 
 
 @torch.inference_mode()
@@ -226,7 +242,6 @@ def benchmark_model(
     model.eval()
     set_seed(cfg.eval_seed)
 
-    # stop at <end_of_turn> if token exists
     end_turn_id = tokenizer.convert_tokens_to_ids(END_TURN)
     eos_ids = [tokenizer.eos_token_id]
     if isinstance(end_turn_id, int) and end_turn_id >= 0 and end_turn_id != tokenizer.unk_token_id:
@@ -260,14 +275,12 @@ def benchmark_model(
         completions = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
         completions = [_strip_control(c) for c in completions]
 
-        # pass refs via kwargs (same way TRL will pass dataset columns)
         batch_rewards = reward_fn(batch_prompts, completions, ref_ta=batch_refs)
         rewards.extend(batch_rewards)
 
     mean_r = statistics.mean(rewards) if rewards else 0.0
     std_r = statistics.pstdev(rewards) if len(rewards) > 1 else 0.0
     print(f"[benchmark:{label}] n={len(rewards)} mean={mean_r:.4f} std={std_r:.4f}")
-
     return {"label": label, "count": float(len(rewards)), "mean": float(mean_r), "std": float(std_r)}
 
 
@@ -287,6 +300,14 @@ def main() -> None:
     setup_wandb_env(cfg)
     set_seed(cfg.seed)
 
+    # auto steps for 2k–5k regime
+    if cfg.max_steps <= 0:
+        cfg.max_steps = int(math.ceil(cfg.num_train_samples / max(1, cfg.gradient_accumulation_steps)))
+    if cfg.save_steps <= 0:
+        cfg.save_steps = cfg.max_steps
+
+    print(f"[config] num_train_samples={cfg.num_train_samples} grad_accum={cfg.gradient_accumulation_steps} -> max_steps={cfg.max_steps}")
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cuda":
         torch.set_float32_matmul_precision("high")
@@ -296,12 +317,10 @@ def main() -> None:
         tok.pad_token = tok.eos_token
     tok.padding_side = "left"
 
-    model = Gemma3ForCausalLM.from_pretrained(
-        cfg.model_id,
-        torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
-    ).to(device)
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    model = _from_pretrained_with_dtype(cfg.model_id, dtype=dtype, device=device).eval()
 
-    # Encourage generation to stop at <end_of_turn>
+    # Encourage stopping at <end_of_turn>
     end_turn_id = tok.convert_tokens_to_ids(END_TURN)
     eos_ids = [tok.eos_token_id]
     if isinstance(end_turn_id, int) and end_turn_id >= 0 and end_turn_id != tok.unk_token_id:
@@ -321,10 +340,12 @@ def main() -> None:
         qe_metric_name="Unbabel/wmt22-cometkiwi-da",
         normalize="auto",
         reward_device=device,
-        comet_batch_size=64,
+        comet_batch_size=32,
         ref_key="ref_ta",
         w_ref=0.85,
         w_qe=0.15,
+        penalty_weight_script=0.25,
+        penalty_weight_lenratio=0.05,
     )
 
     pre = benchmark_model(
@@ -357,11 +378,9 @@ def main() -> None:
         seed=cfg.seed,
         remove_unused_columns=False,
 
-        # W&B via HF/TRL only
         report_to=(["wandb"] if cfg.use_wandb else ["none"]),
         run_name=cfg.wandb_run_name,
 
-        # Hub
         push_to_hub=cfg.push_to_hub,
         hub_model_id=cfg.hub_model_id or None,
         hub_token=cfg.hub_token or None,
