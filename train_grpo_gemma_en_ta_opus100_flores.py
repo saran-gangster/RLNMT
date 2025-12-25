@@ -53,7 +53,7 @@ class RunCfg:
     resume_from_checkpoint: str = ""
 
     # Eval: FLORES-200 eng_Latn-tam_Taml
-    flores_dataset_candidates: Tuple[str, ...] = ("facebook/flores", "facebook/flores200", "Muennighoff/flores200")
+    flores_dataset_candidates: Tuple[str, ...] = ("openlanguagedata/flores_plus", "facebook/flores", "gsarti/flores_101")
     flores_pair_config: str = "eng_Latn-tam_Taml"
     flores_split: str = "devtest"  # "dev" or "devtest"
     num_eval_samples: int = 128
@@ -170,15 +170,24 @@ def load_flores200_stream(cfg: RunCfg):
     last_err: Optional[Exception] = None
     for ds_id in cfg.flores_dataset_candidates:
         try:
+            # Try with config first
             return _load_dataset_trust(
                 ds_id,
                 cfg.flores_pair_config,
                 split=cfg.flores_split,
                 streaming=True,
             )
-        except Exception as e:
-            last_err = e
-            continue
+        except Exception as e1:
+            try:
+                # Try without config (some datasets don't have pair configs)
+                return _load_dataset_trust(
+                    ds_id,
+                    split=cfg.flores_split,
+                    streaming=True,
+                )
+            except Exception as e2:
+                last_err = e2
+                continue
 
     raise RuntimeError(
         f"Could not load FLORES-200 from any of: {cfg.flores_dataset_candidates} "
@@ -193,9 +202,9 @@ def materialize_flores_eval(cfg: RunCfg) -> Dataset:
     take_cap = cfg.num_eval_samples * 5
 
     for ex in stream.take(take_cap):
-        # For paired config eng_Latn-tam_Taml, these are the common column names
-        en = (ex.get("sentence_eng_Latn") or "").strip()
-        ta = (ex.get("sentence_tam_Taml") or "").strip()
+        # Try different column name formats
+        en = (ex.get("sentence_eng_Latn") or ex.get("eng_Latn") or ex.get("en") or "").strip()
+        ta = (ex.get("sentence_tam_Taml") or ex.get("tam_Taml") or ex.get("ta") or "").strip()
         if not en or not ta:
             continue
 
