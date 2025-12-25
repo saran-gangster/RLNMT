@@ -139,7 +139,6 @@ def materialize_opus100_train(cfg: RunCfg) -> Dataset:
         cfg.train_config,
         split=cfg.train_split,
         streaming=True,
-        trust_remote_code=True,
     )
 
     if cfg.shuffle_buffer and cfg.shuffle_buffer > 0:
@@ -176,7 +175,6 @@ def load_flores200_stream(cfg: RunCfg):
                 cfg.flores_pair_config,
                 split=cfg.flores_split,
                 streaming=True,
-                trust_remote_code=True,  # <-- fixes your crash
             )
         except Exception as e:
             last_err = e
