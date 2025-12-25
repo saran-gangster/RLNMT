@@ -201,10 +201,10 @@ def _append_benchmark_line(metrics: Dict[str, float], path: str) -> None:
         f.write(line)
 
 
-def setup_wandb(cfg: RunCfg) -> None:
+def setup_wandb(cfg: RunCfg):
     if not cfg.use_wandb:
         os.environ["WANDB_DISABLED"] = "true"
-        return
+        return None
 
     # Avoid tokenizer fork warnings
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -222,12 +222,29 @@ def setup_wandb(cfg: RunCfg) -> None:
         import wandb_reward_callback
         wandb_reward_callback.login(key=cfg.wandb_api_key, relogin=True)
 
+    import wandb
+
+    run = wandb.init(
+        project=cfg.wandb_project,
+        entity=cfg.wandb_entity or None,
+        name=cfg.wandb_run_name,
+        config={
+            "seed": cfg.seed,
+            "max_steps": cfg.max_steps,
+            "model_id": cfg.model_id,
+            "dataset": cfg.dataset_name,
+        },
+        reinit=True,
+    )
+
+    return run
+
 
 def main() -> None:
     cfg = RunCfg()
     os.makedirs(cfg.output_dir, exist_ok=True)
 
-    setup_wandb(cfg)
+    wandb_run = setup_wandb(cfg)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cuda":
@@ -345,6 +362,9 @@ def main() -> None:
             },
             step=trainer.state.global_step,
         )
+
+    if wandb_run is not None:
+        wandb_run.finish()
 
     if cfg.push_to_hub:
         trainer.push_to_hub(
