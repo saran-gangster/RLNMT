@@ -1,19 +1,18 @@
+# train_grpo_gemma_en_ta_opus100_flores.py
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
-from typing import List, Dict, Sequence
-
-import statistics
 import re
+import statistics
+from dataclasses import dataclass
+from typing import Any, Dict, List, Sequence, Tuple, Optional
 
 import torch
 from datasets import load_dataset, Dataset
-
 from transformers import AutoTokenizer, Gemma3ForCausalLM, set_seed
 from trl import GRPOTrainer, GRPOConfig
 
-from rewards_en_ta_dupo import CometDuPOReward
+from rewards_en_ta_refcomet import CometRefQeReward
 
 END_TURN = "<end_of_turn>"
 CTRL_RE = re.compile(r"<start_of_turn>|<end_of_turn>|user|model")
@@ -21,48 +20,55 @@ CTRL_RE = re.compile(r"<start_of_turn>|<end_of_turn>|user|model")
 
 @dataclass
 class RunCfg:
+    # Model
     model_id: str = "google/gemma-3-1b-it"
 
-    dataset_name: str = "allenai/c4"
-    dataset_config: str = "en"
-    dataset_split: str = "train"
-    text_field: str = "text"
-    num_train_samples: int = 2000
+    # Train dataset: OPUS-100 en-ta
+    train_dataset_id: str = "Helsinki-NLP/opus-100"
+    train_config: str = "en-ta"
+    train_split: str = "train"
+    num_train_samples: int = 3000
     shuffle_buffer: int = 10_000
 
-    # Make the task easier / less noisy: short sentence-ish chunks
-    max_chars: int = 240
-    min_chars: int = 40
+    # Sentence-ish filters
+    min_chars: int = 5
+    max_chars: int = 220
 
-    output_dir: str = "./grpo_gemma_en_ta_ckpts"
-    max_steps: int = 400  # 200 is usually too small to see consistent movement
+    # GRPO
+    output_dir: str = "./grpo_gemma_en_ta_opus100"
+    max_steps: int = 750
     group_size: int = 8
     temperature: float = 0.7
     max_new_tokens: int = 160
     lr: float = 5e-7
-    kl_beta: float = 0.10
+    kl_beta: float = 0.12
     gradient_accumulation_steps: int = 4
     seed: int = 42
     logging_steps: int = 10
-    save_steps: int = 200
-    save_total_limit: int = 1
+    save_steps: int = max_steps
+    save_total_limit: int = 2
     resume_from_checkpoint: str = ""
 
-    num_eval_samples: int = 64
-    eval_batch_size: int = 12
+    # Eval dataset: FLORES-200 eng_Latn-tam_Taml
+    flores_dataset_candidates: Tuple[str, ...] = ("facebook/flores", "facebook/flores200", "Muennighoff/flores200")
+    flores_pair_config: str = "eng_Latn-tam_Taml"
+    flores_split: str = "devtest"  # "dev" or "devtest"
+    num_eval_samples: int = 256
+    eval_batch_size: int = 16
     eval_max_new_tokens: int = 160
     eval_seed: int = 1234
 
-    # W&B: use ONLY HF/TRL integration (no manual wandb.init)
+    # W&B: rely on HF/TRL (no manual wandb.init)
     use_wandb: bool = True
-    wandb_api_key: str = ""     # optional
+    wandb_api_key: str = ""  # optional
     wandb_project: str = "rl-nmt-en-ta-dupo"
     wandb_entity: str = ""
-    wandb_run_name: str = "gemma3-1b-it-grpo-en-ta"
+    wandb_run_name: str = "gemma3-1b-it-grpo-opus100-en-ta"
     wandb_mode: str = "online"
 
+    # Hub
     push_to_hub: bool = True
-    hub_model_id: str = "Saran-Gangster/gemma3-en-ta-grpo"
+    hub_model_id: str = "Saran-Gangster/gemma3-en-ta-grpo-opus100"
     hub_token: str = ""
     hub_private: bool = True
 
@@ -71,7 +77,6 @@ def setup_wandb_env(cfg: RunCfg) -> None:
     if not cfg.use_wandb:
         os.environ["WANDB_DISABLED"] = "true"
         return
-
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     os.environ.setdefault("WANDB_PROJECT", cfg.wandb_project)
     if cfg.wandb_entity:
@@ -94,109 +99,147 @@ def make_gemma_prompt(english: str) -> str:
     )
 
 
-def _clean_c4_text(text: str, cfg: RunCfg) -> str:
-    text = (text or "").strip()
-    text = re.sub(r"\s+", " ", text)
-
-    # Drop super noisy web junk
-    if "http://" in text or "https://" in text or "www." in text:
-        return ""
-    if len(text) < cfg.min_chars:
-        return ""
-
-    # Prefer first sentence-ish chunk for stability
-    parts = re.split(r"(?<=[.!?])\s+", text)
-    text = parts[0] if parts and len(parts[0]) >= cfg.min_chars else text
-
-    text = text[: cfg.max_chars].strip()
-    if len(text) < cfg.min_chars:
-        return ""
-    return text
-
-
-def materialize_small_dataset(cfg: RunCfg) -> Dataset:
-    stream = load_dataset(
-        cfg.dataset_name,
-        cfg.dataset_config,
-        split=cfg.dataset_split,
-        streaming=True,
-    )
-    if cfg.shuffle_buffer and cfg.shuffle_buffer > 0:
-        stream = stream.shuffle(seed=cfg.seed, buffer_size=cfg.shuffle_buffer)
-
-    rows: List[Dict[str, str]] = []
-    for ex in stream.take(cfg.num_train_samples * 3):
-        text = _clean_c4_text(ex.get(cfg.text_field) or "", cfg)
-        if not text:
-            continue
-        rows.append({"prompt": make_gemma_prompt(text)})
-        if len(rows) >= cfg.num_train_samples:
-            break
-
-    if not rows:
-        raise RuntimeError("No examples materialized; check dataset/text_field/filters.")
-
-    return Dataset.from_list(rows)
-
-
-def materialize_eval_dataset(cfg: RunCfg) -> Dataset:
-    stream = load_dataset(
-        cfg.dataset_name,
-        cfg.dataset_config,
-        split=cfg.dataset_split,
-        streaming=True,
-    )
-    if cfg.shuffle_buffer and cfg.shuffle_buffer > 0:
-        stream = stream.shuffle(seed=cfg.eval_seed, buffer_size=cfg.shuffle_buffer)
-
-    rows: List[Dict[str, str]] = []
-    for ex in stream.take(cfg.num_eval_samples * 3):
-        text = _clean_c4_text(ex.get(cfg.text_field) or "", cfg)
-        if not text:
-            continue
-        rows.append({"prompt": make_gemma_prompt(text)})
-        if len(rows) >= cfg.num_eval_samples:
-            break
-
-    if not rows:
-        raise RuntimeError("No eval examples materialized; check dataset/text_field/filters.")
-
-    return Dataset.from_list(rows)
-
-
 def _strip_control(text: str) -> str:
-    text = text.replace("\u200b", "")
+    text = (text or "").replace("\u200b", "")
     text = CTRL_RE.sub("", text).strip()
     if END_TURN in text:
         text = text.split(END_TURN, 1)[0]
     return " ".join(text.split()).strip()
 
 
+def _get_en_ta_from_opus(ex: Dict[str, Any]) -> Tuple[str, str]:
+    """
+    Handles both shapes:
+      1) {"translation": {"en": "...", "ta": "..."}}
+      2) {"en": "...", "ta": "..."}
+    """
+    if isinstance(ex.get("translation"), dict):
+        en = ex["translation"].get("en", "") or ""
+        ta = ex["translation"].get("ta", "") or ""
+        return en, ta
+    en = ex.get("en", "") or ""
+    ta = ex.get("ta", "") or ""
+    return en, ta
+
+
+def materialize_opus100_train(cfg: RunCfg) -> Dataset:
+    stream = load_dataset(cfg.train_dataset_id, cfg.train_config, split=cfg.train_split, streaming=True)
+
+    if cfg.shuffle_buffer and cfg.shuffle_buffer > 0:
+        stream = stream.shuffle(seed=cfg.seed, buffer_size=cfg.shuffle_buffer)
+
+    rows: List[Dict[str, str]] = []
+    take_cap = cfg.num_train_samples * 5
+
+    for ex in stream.take(take_cap):
+        en, ta = _get_en_ta_from_opus(ex)
+        en = " ".join((en or "").split()).strip()
+        ta = " ".join((ta or "").split()).strip()
+
+        if not en or not ta:
+            continue
+        if len(en) < cfg.min_chars or len(en) > cfg.max_chars:
+            continue
+
+        # Keep the ref out of the prompt; store in extra column for reward
+        rows.append({"prompt": make_gemma_prompt(en), "ref_ta": ta})
+        if len(rows) >= cfg.num_train_samples:
+            break
+
+    if not rows:
+        raise RuntimeError("No train examples materialized from OPUS-100. Check config/split.")
+    return Dataset.from_list(rows)
+
+
+def _get_any(ex: Dict[str, Any], keys: Sequence[str]) -> str:
+    for k in keys:
+        v = ex.get(k, None)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+def load_flores200_stream(cfg: RunCfg):
+    last_err: Optional[Exception] = None
+    for ds_id in cfg.flores_dataset_candidates:
+        try:
+            return load_dataset(ds_id, cfg.flores_pair_config, split=cfg.flores_split, streaming=True)
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(
+        f"Could not load FLORES-200 from any of: {cfg.flores_dataset_candidates} "
+        f"with config={cfg.flores_pair_config} split={cfg.flores_split}. Last error: {last_err}"
+    )
+
+
+def materialize_flores_eval(cfg: RunCfg) -> Dataset:
+    stream = load_flores200_stream(cfg)
+
+    rows: List[Dict[str, str]] = []
+    take_cap = cfg.num_eval_samples * 3
+
+    for ex in stream.take(take_cap):
+        # Common column names for paired FLORES configs
+        en = _get_any(ex, ["sentence_eng_Latn", "sentence_en", "eng", "English", "sentence"])
+        ta = _get_any(ex, ["sentence_tam_Taml", "sentence_ta", "tam", "Tamil"])
+
+        # If the config is paired, usually both exist; if not, skip.
+        if not en or not ta:
+            # Some builders put languages as sentence_{lang}
+            en = _get_any(ex, ["sentence_eng_Latn"])
+            ta = _get_any(ex, ["sentence_tam_Taml"])
+            if not en or not ta:
+                continue
+
+        en = " ".join(en.split()).strip()
+        ta = " ".join(ta.split()).strip()
+
+        if not en or not ta:
+            continue
+        if len(en) < cfg.min_chars:
+            continue
+        en = en[: cfg.max_chars].strip()
+        if len(en) < cfg.min_chars:
+            continue
+
+        rows.append({"prompt": make_gemma_prompt(en), "ref_ta": ta})
+        if len(rows) >= cfg.num_eval_samples:
+            break
+
+    if not rows:
+        raise RuntimeError("No FLORES eval examples materialized; check dataset/config/split.")
+    return Dataset.from_list(rows)
+
+
 @torch.inference_mode()
 def benchmark_model(
     model: torch.nn.Module,
     tokenizer: AutoTokenizer,
-    reward_fn: CometDuPOReward,
+    reward_fn: CometRefQeReward,
     prompts: Sequence[str],
+    refs: Sequence[str],
     cfg: RunCfg,
     device: str,
     label: str,
 ) -> Dict[str, float]:
-    rewards: List[float] = []
     model.eval()
-
-    # Deterministic benchmark
     set_seed(cfg.eval_seed)
 
+    # stop at <end_of_turn> if token exists
     end_turn_id = tokenizer.convert_tokens_to_ids(END_TURN)
     eos_ids = [tokenizer.eos_token_id]
     if isinstance(end_turn_id, int) and end_turn_id >= 0 and end_turn_id != tokenizer.unk_token_id:
         eos_ids.append(end_turn_id)
 
-    for idx in range(0, len(prompts), cfg.eval_batch_size):
-        batch_prompts = prompts[idx : idx + cfg.eval_batch_size]
+    rewards: List[float] = []
+
+    for i in range(0, len(prompts), cfg.eval_batch_size):
+        batch_prompts = list(prompts[i : i + cfg.eval_batch_size])
+        batch_refs = list(refs[i : i + cfg.eval_batch_size])
+
         enc = tokenizer(
-            list(batch_prompts),
+            batch_prompts,
             return_tensors="pt",
             padding=True,
             truncation=True,
@@ -217,20 +260,15 @@ def benchmark_model(
         completions = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
         completions = [_strip_control(c) for c in completions]
 
-        batch_rewards = reward_fn(list(batch_prompts), completions)
+        # pass refs via kwargs (same way TRL will pass dataset columns)
+        batch_rewards = reward_fn(batch_prompts, completions, ref_ta=batch_refs)
         rewards.extend(batch_rewards)
 
     mean_r = statistics.mean(rewards) if rewards else 0.0
     std_r = statistics.pstdev(rewards) if len(rewards) > 1 else 0.0
-
     print(f"[benchmark:{label}] n={len(rewards)} mean={mean_r:.4f} std={std_r:.4f}")
 
-    return {
-        "label": label,
-        "count": float(len(rewards)),
-        "mean": float(mean_r),
-        "std": float(std_r),
-    }
+    return {"label": label, "count": float(len(rewards)), "mean": float(mean_r), "std": float(std_r)}
 
 
 def _append_benchmark_line(metrics: Dict[str, float], path: str) -> None:
@@ -246,7 +284,6 @@ def _append_benchmark_line(metrics: Dict[str, float], path: str) -> None:
 def main() -> None:
     cfg = RunCfg()
     os.makedirs(cfg.output_dir, exist_ok=True)
-
     setup_wandb_env(cfg)
     set_seed(cfg.seed)
 
@@ -272,32 +309,35 @@ def main() -> None:
     model.generation_config.eos_token_id = eos_ids
     model.generation_config.pad_token_id = tok.pad_token_id
 
-    ds = materialize_small_dataset(cfg)
-    eval_ds = materialize_eval_dataset(cfg)
+    train_ds = materialize_opus100_train(cfg)
+    eval_ds = materialize_flores_eval(cfg)
+
     eval_prompts = list(eval_ds["prompt"])
+    eval_refs = list(eval_ds["ref_ta"])
     bench_path = os.path.join(cfg.output_dir, "benchmark.txt")
 
-    reward_fn = CometDuPOReward(
-        cycle_metric_name="Unbabel/wmt22-comet-da",
+    reward_fn = CometRefQeReward(
+        ref_metric_name="Unbabel/wmt22-comet-da",
         qe_metric_name="Unbabel/wmt22-cometkiwi-da",
-        dual_model_name="facebook/nllb-200-distilled-1.3B",
         normalize="auto",
         reward_device=device,
-        dual_device=device,
-        dual_dtype_bf16=(device == "cuda"),
-        dual_use_safetensors=True,
+        comet_batch_size=64,
+        ref_key="ref_ta",
+        w_ref=0.85,
+        w_qe=0.15,
     )
 
-    pre_metrics = benchmark_model(
+    pre = benchmark_model(
         model=model,
         tokenizer=tok,
         reward_fn=reward_fn,
         prompts=eval_prompts,
+        refs=eval_refs,
         cfg=cfg,
         device=device,
-        label="pretrain",
+        label="pretrain_flores",
     )
-    _append_benchmark_line(pre_metrics, bench_path)
+    _append_benchmark_line(pre, bench_path)
 
     training_args = GRPOConfig(
         output_dir=cfg.output_dir,
@@ -316,19 +356,23 @@ def main() -> None:
         save_total_limit=cfg.save_total_limit,
         seed=cfg.seed,
         remove_unused_columns=False,
+
+        # W&B via HF/TRL only
+        report_to=(["wandb"] if cfg.use_wandb else ["none"]),
+        run_name=cfg.wandb_run_name,
+
+        # Hub
         push_to_hub=cfg.push_to_hub,
         hub_model_id=cfg.hub_model_id or None,
         hub_token=cfg.hub_token or None,
         hub_private_repo=cfg.hub_private,
-        report_to=(["wandb"] if cfg.use_wandb else ["none"]),
-        run_name=cfg.wandb_run_name,
     )
 
     trainer = GRPOTrainer(
         model=model,
         reward_funcs=[reward_fn],
         args=training_args,
-        train_dataset=ds,
+        train_dataset=train_ds,
         processing_class=tok,
     )
 
@@ -336,16 +380,17 @@ def main() -> None:
     trainer.save_model(cfg.output_dir)
     tok.save_pretrained(cfg.output_dir)
 
-    post_metrics = benchmark_model(
+    post = benchmark_model(
         model=trainer.model,
         tokenizer=tok,
         reward_fn=reward_fn,
         prompts=eval_prompts,
+        refs=eval_refs,
         cfg=cfg,
         device=device,
-        label="posttrain",
+        label="posttrain_flores",
     )
-    _append_benchmark_line(post_metrics, bench_path)
+    _append_benchmark_line(post, bench_path)
 
     if cfg.push_to_hub:
         print(f"Pushing to hub repo: {cfg.hub_model_id} (private={cfg.hub_private})")
