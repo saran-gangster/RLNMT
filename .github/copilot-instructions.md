@@ -1,0 +1,27 @@
+# RL NMT GRPO guidance
+- Purpose: GRPO-tune Gemma-3 chat models for English→Tamil translation with COMET-based DuPO rewards; core entrypoint is [train_grpo_en_ta.py](../train_grpo_en_ta.py).
+- Data: stream English-only C4 ([train_grpo_en_ta.py](../train_grpo_en_ta.py)), keep `num_train_samples` small (1–3k) and truncate to `max_chars` to fit VRAM.
+- Prompt format: chat-style with `<start_of_turn>/<end_of_turn>` tokens and explicit English/Tamil cues; generator must only output Tamil ([train_grpo_en_ta.py](../train_grpo_en_ta.py)).
+- Tokenization: Gemma tokenizer left-padded with `pad_token = eos` ([train_grpo_en_ta.py](../train_grpo_en_ta.py)); keep this for generate + GRPO batches.
+- Model load: Gemma3ForCausalLM in bf16 when CUDA is available; fallback to fp32 on CPU ([train_grpo_en_ta.py](../train_grpo_en_ta.py)).
+- Reward fn: `CometDuPOReward` combines COMET-DA cycle + COMETKiwi QE + penalties for non-Tamil script and length ratio ([rewards_en_ta_dupo.py](../rewards_en_ta_dupo.py)).
+- Backtranslation: Tamil outputs are sent through NLLB-200 distilled 1.3B (tam→eng) to compute COMET cycle scores; uses deterministic beam search ([rewards_en_ta_dupo.py](../rewards_en_ta_dupo.py)).
+- Normalization: rewards are clamped to [0,1] via identity normalization; any other `normalize` value raises ([rewards_en_ta_dupo.py](../rewards_en_ta_dupo.py)).
+- Penalties: Latin chars and missing Tamil script incur `penalty_weight_script`; length ratio penalty is |log(len_ta/len_en)| scaled ([rewards_en_ta_dupo.py](../rewards_en_ta_dupo.py)).
+- Logging for W&B: `reward_fn.last_log` is populated during __call__ and consumed by `WandbRewardCallback` ([rewards_en_ta_dupo.py](../rewards_en_ta_dupo.py), [wandb_reward_callback.py](../wandb_reward_callback.py)).
+- Trainer config: GRPO uses `group_size=num_generations`, temperature, KL beta, and accumulation from `RunCfg`; see [train_grpo_en_ta.py](../train_grpo_en_ta.py).
+- Wandb setup: toggle via `use_wandb`; env defaults set in `setup_wandb`, and optional inline API key login avoids CLI prompts ([train_grpo_en_ta.py](../train_grpo_en_ta.py)).
+- Disabling W&B: set `use_wandb=False` in `RunCfg` or export `WANDB_DISABLED=true`; otherwise run with valid login or `wandb_mode="offline"` ([train_grpo_en_ta.py](../train_grpo_en_ta.py)).
+- Precision/VRAM: on CUDA, `torch.set_float32_matmul_precision("high")` is enabled and bf16 is used; keep batch size 1 with gradient accumulation to stay within memory ([train_grpo_en_ta.py](../train_grpo_en_ta.py)).
+- Dataset handling: stream shuffle with `buffer_size`; rows materialized in-memory only for the requested sample count to avoid large disk writes ([train_grpo_en_ta.py](../train_grpo_en_ta.py)).
+- Reward devices: COMET metrics move to `reward_device`; backtranslation model to `dual_device`, optionally bf16; both default to CUDA—override to CPU if GPU unavailable ([rewards_en_ta_dupo.py](../rewards_en_ta_dupo.py)).
+- Safety: do not commit WANDB API keys; `RunCfg.wandb_api_key` is meant for local edits only ([train_grpo_en_ta.py](../train_grpo_en_ta.py)).
+- Smoke test: [smoke_test_rewards.py](../smoke_test_rewards.py) can generate a sample and print reward breakdown; it currently calls `reward_fn.score_components`, which is not implemented—mirror the logic in `CometDuPOReward.__call__` if you need detailed stats.
+- Prompt cleaning: helper functions strip control tokens and zero-width spaces before scoring ([rewards_en_ta_dupo.py](../rewards_en_ta_dupo.py)).
+- Backtranslation language tags: tokenizer `src_lang="tam_Taml"`, forced BOS `eng_Latn`; keep if changing NLLB model ([rewards_en_ta_dupo.py](../rewards_en_ta_dupo.py)).
+- Callback frequency: `WandbRewardCallback.log_every` defaults to every optimizer step and computes an EMA for smoother reward curves ([wandb_reward_callback.py](../wandb_reward_callback.py)).
+- Training entrypoint: run `python train_grpo_en_ta.py`; checkpoints saved to `output_dir` from `RunCfg` ([train_grpo_en_ta.py](../train_grpo_en_ta.py)).
+- Quick reward probe without training: call `CometDuPOReward([prompt],[tamil])` directly; ensure `reward_device`/`dual_device` fit hardware ([rewards_en_ta_dupo.py](../rewards_en_ta_dupo.py)).
+- Common edits: adjust `group_size`, `temperature`, `kl_beta`, or dataset sample count for stability before touching reward weights.
+- External deps: requires `torch`, `transformers`, `trl`, `datasets`, `comet`, `wandb`; heavy models (Gemma, NLLB) imply GPU + ample VRAM.
+- If adding new callbacks/rewards: preserve `reward_fn.last_log` contract so W&B logging stays intact, and keep `__name__` property for TRL compatibility ([rewards_en_ta_dupo.py](../rewards_en_ta_dupo.py)).

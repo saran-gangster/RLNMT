@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import List, Dict, Optional
+from typing import List, Dict, Sequence
+
+import statistics
+import re
 
 import torch
 from datasets import load_dataset, Dataset
@@ -11,6 +14,10 @@ from transformers import AutoTokenizer, Gemma3ForCausalLM
 from trl import GRPOTrainer, GRPOConfig
 
 from rewards_en_ta_dupo import CometDuPOReward
+
+
+END_TURN = "<end_of_turn>"
+CTRL_RE = re.compile(r"<start_of_turn>|<end_of_turn>|user|model")
 
 
 @dataclass
@@ -38,6 +45,13 @@ class RunCfg:
     gradient_accumulation_steps: int = 4
     seed: int = 42
 
+    # Eval / benchmarking
+    num_eval_samples: int = 64
+    eval_batch_size: int = 4
+    eval_temperature: float = 0.8
+    eval_max_new_tokens: int = 256
+    eval_seed: int = 1234
+
     # ---- Weights & Biases logging ----
     use_wandb: bool = True
 
@@ -48,6 +62,12 @@ class RunCfg:
     wandb_entity: str = ""   # optional; set if your org requires it
     wandb_run_name: str = "gemma3-1b-it-grpo-en-ta"
     wandb_mode: str = "online"  # "online" or "offline"
+
+    # ---- Hugging Face Hub push ----
+    push_to_hub: bool = False
+    hub_model_id: str = "Saran-Gangster/gemma3-en-ta-grpo"       # e.g. "yourname/gemma3-en-ta-grpo"
+    hub_token: str = ""          # optional; else uses HF_TOKEN / ~/.huggingface
+    hub_private: bool = True
 
 
 def make_gemma_prompt(english: str) -> str:
@@ -85,6 +105,100 @@ def materialize_small_dataset(cfg: RunCfg) -> Dataset:
         raise RuntimeError("No examples materialized; check dataset/text_field.")
 
     return Dataset.from_list(rows)
+
+
+def materialize_eval_dataset(cfg: RunCfg) -> Dataset:
+    stream = load_dataset(
+        cfg.dataset_name,
+        cfg.dataset_config,
+        split=cfg.dataset_split,
+        streaming=True,
+    )
+    if cfg.shuffle_buffer and cfg.shuffle_buffer > 0:
+        stream = stream.shuffle(seed=cfg.eval_seed, buffer_size=cfg.shuffle_buffer)
+
+    rows: List[Dict[str, str]] = []
+    for ex in stream.take(cfg.num_eval_samples):
+        text = (ex.get(cfg.text_field) or "").strip()
+        if not text:
+            continue
+        text = text[: cfg.max_chars]
+        rows.append({"prompt": make_gemma_prompt(text)})
+
+    if not rows:
+        raise RuntimeError("No eval examples materialized; check dataset/text_field.")
+
+    return Dataset.from_list(rows)
+
+
+def _strip_control(text: str) -> str:
+    text = text.replace("\u200b", "")
+    text = CTRL_RE.sub("", text).strip()
+    if END_TURN in text:
+        text = text.split(END_TURN, 1)[0]
+    return " ".join(text.split()).strip()
+
+
+@torch.inference_mode()
+def benchmark_model(
+    model: torch.nn.Module,
+    tokenizer: AutoTokenizer,
+    reward_fn: CometDuPOReward,
+    prompts: Sequence[str],
+    cfg: RunCfg,
+    device: str,
+    label: str,
+) -> Dict[str, float]:
+    rewards: List[float] = []
+    model.eval()
+
+    for idx in range(0, len(prompts), cfg.eval_batch_size):
+        batch_prompts = prompts[idx : idx + cfg.eval_batch_size]
+        enc = tokenizer(
+            list(batch_prompts),
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=512,
+        ).to(device)
+
+        input_len = enc["input_ids"].shape[1]
+        gen = model.generate(
+            **enc,
+            do_sample=True,
+            temperature=cfg.eval_temperature,
+            max_new_tokens=cfg.eval_max_new_tokens,
+        )
+
+        gen_ids = gen[:, input_len:]
+        completions = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+        completions = [_strip_control(c) for c in completions]
+
+        batch_rewards = reward_fn(list(batch_prompts), completions)
+        rewards.extend(batch_rewards)
+
+    mean_r = statistics.mean(rewards) if rewards else 0.0
+    std_r = statistics.pstdev(rewards) if len(rewards) > 1 else 0.0
+
+    print(f"[benchmark:{label}] n={len(rewards)} mean={mean_r:.4f} std={std_r:.4f}")
+
+    return {
+        "label": label,
+        "count": float(len(rewards)),
+        "mean": float(mean_r),
+        "std": float(std_r),
+    }
+
+
+def _append_benchmark_line(metrics: Dict[str, float], path: str) -> None:
+    # Append a single benchmark line for easy offline inspection
+    header = "label\tcount\tmean\tstd\n"
+    line = f"{metrics['label']}\t{metrics['count']:.0f}\t{metrics['mean']:.4f}\t{metrics['std']:.4f}\n"
+    needs_header = not os.path.exists(path)
+    with open(path, "a", encoding="utf-8") as f:
+        if needs_header:
+            f.write(header)
+        f.write(line)
 
 
 def setup_wandb(cfg: RunCfg) -> None:
@@ -131,6 +245,9 @@ def main() -> None:
     ).to(device)
 
     ds = materialize_small_dataset(cfg)
+    eval_ds = materialize_eval_dataset(cfg)
+    eval_prompts = list(eval_ds["prompt"])
+    bench_path = os.path.join(cfg.output_dir, "benchmark.txt")
 
     reward_fn = CometDuPOReward(
         cycle_metric_name="Unbabel/wmt22-comet-da",
@@ -142,6 +259,29 @@ def main() -> None:
         dual_dtype_bf16=(device == "cuda"),
         dual_use_safetensors=True,
     )
+
+    pre_metrics = benchmark_model(
+        model=model,
+        tokenizer=tok,
+        reward_fn=reward_fn,
+        prompts=eval_prompts,
+        cfg=cfg,
+        device=device,
+        label="pretrain",
+    )
+    _append_benchmark_line(pre_metrics, bench_path)
+
+    if cfg.use_wandb:
+        import wandb
+
+        wandb.log(
+            {
+                "benchmark/pre/mean": pre_metrics["mean"],
+                "benchmark/pre/std": pre_metrics["std"],
+                "benchmark/pre/count": pre_metrics["count"],
+            },
+            step=0,
+        )
 
     training_args = GRPOConfig(
         output_dir=cfg.output_dir,
@@ -158,6 +298,10 @@ def main() -> None:
         save_steps=50,
         seed=cfg.seed,
         remove_unused_columns=False,
+        push_to_hub=cfg.push_to_hub,
+        hub_model_id=cfg.hub_model_id or None,
+        hub_token=cfg.hub_token or None,
+        hub_private_repo=cfg.hub_private,
 
         # W&B
         report_to=(["wandb"] if cfg.use_wandb else ["none"]),
@@ -176,6 +320,38 @@ def main() -> None:
 
     trainer.train()
     trainer.save_model(cfg.output_dir)
+    tok.save_pretrained(cfg.output_dir)
+
+    post_metrics = benchmark_model(
+        model=trainer.model,
+        tokenizer=tok,
+        reward_fn=reward_fn,
+        prompts=eval_prompts,
+        cfg=cfg,
+        device=device,
+        label="posttrain",
+    )
+    _append_benchmark_line(post_metrics, bench_path)
+
+    if cfg.use_wandb:
+        import wandb
+
+        wandb.log(
+            {
+                "benchmark/post/mean": post_metrics["mean"],
+                "benchmark/post/std": post_metrics["std"],
+                "benchmark/post/count": post_metrics["count"],
+                "benchmark/pre/mean": pre_metrics["mean"],
+            },
+            step=trainer.state.global_step,
+        )
+
+    if cfg.push_to_hub:
+        trainer.push_to_hub(
+            repo_id=cfg.hub_model_id or None,
+            token=cfg.hub_token or None,
+            private=cfg.hub_private,
+        )
 
 
 if __name__ == "__main__":
