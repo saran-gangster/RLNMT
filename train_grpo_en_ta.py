@@ -68,7 +68,7 @@ class RunCfg:
     wandb_mode: str = "online"  # "online" or "offline"
 
     # ---- Hugging Face Hub push ----
-    push_to_hub: bool = False
+    push_to_hub: bool = True
     hub_model_id: str = "Saran-Gangster/gemma3-en-ta-grpo"       # e.g. "yourname/gemma3-en-ta-grpo"
     hub_token: str = ""          # optional; else uses HF_TOKEN / ~/.huggingface
     hub_private: bool = True
@@ -373,6 +373,7 @@ def main() -> None:
         wandb_run.finish()
 
     if cfg.push_to_hub:
+        print(f"Pushing to hub repo: {cfg.hub_model_id} (private={cfg.hub_private})")
         trainer.push_to_hub(
             repo_id=cfg.hub_model_id or None,
             token=cfg.hub_token or None,
