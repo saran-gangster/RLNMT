@@ -44,6 +44,10 @@ class RunCfg:
     kl_beta: float = 0.05
     gradient_accumulation_steps: int = 4
     seed: int = 42
+    logging_steps: int = 10
+    save_steps: int = 200           # set to max_steps to save only once
+    save_total_limit: int = 1       # keep disk use low
+    resume_from_checkpoint: str = ""  # local path or HF repo id
 
     # Eval / benchmarking
     num_eval_samples: int = 64
@@ -312,8 +316,9 @@ def main() -> None:
         temperature=cfg.temperature,
         max_completion_length=cfg.max_new_tokens,
         bf16=(device == "cuda"),
-        logging_steps=10,
-        save_steps=50,
+        logging_steps=cfg.logging_steps,
+        save_steps=cfg.save_steps,
+        save_total_limit=cfg.save_total_limit,
         seed=cfg.seed,
         remove_unused_columns=False,
         push_to_hub=cfg.push_to_hub,
@@ -336,7 +341,7 @@ def main() -> None:
     from wandb_reward_callback import WandbRewardCallback
     trainer.add_callback(WandbRewardCallback(reward_fn=reward_fn, log_every=1, ema_alpha=0.05))
 
-    trainer.train()
+    trainer.train(resume_from_checkpoint=cfg.resume_from_checkpoint or None)
     trainer.save_model(cfg.output_dir)
     tok.save_pretrained(cfg.output_dir)
 
